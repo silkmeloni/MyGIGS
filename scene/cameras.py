@@ -9,7 +9,8 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 from typing import Optional
-
+from PIL import Image          # 用于 Image.open
+import torch.nn.functional as F # 用于 F.interpolate
 import numpy as np
 import torch
 from torch import nn
@@ -32,6 +33,7 @@ class Camera(nn.Module):
         trans: np.ndarray = np.array([0.0, 0.0, 0.0]),
         scale: float = 1.0,
         data_device: str = "cuda",
+        depth_mono_path=None, #ljx
     ) -> None:
         super(Camera, self).__init__()
 
@@ -84,6 +86,32 @@ class Camera(nn.Module):
             self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))
         ).squeeze(0)
         self.camera_center = self.world_view_transform.inverse()[3, :3]
+
+        #ljx:确保 Camera 类在初始化时读取深度图并将其上传到GPU
+        self.depth_mono_path = depth_mono_path
+        self.mono_depth_image = None
+
+        if depth_mono_path is not None:
+            # 读取深度图，通常单目深度是单通道
+            # 注意：Depth Anything 输出通常是相对深度（disparity 或 inverse depth），或者是 metric depth
+            # 这里假设读取为 float32 的 tensor
+            mono_depth = Image.open(depth_mono_path)
+            mono_depth = torch.from_numpy(np.array(mono_depth)).float()
+
+            # 如果是RGBA或3通道，取第一通道
+            if len(mono_depth.shape) == 3:
+                mono_depth = mono_depth[:, :, 0]
+
+            # Resize 到和 RGB 图像一样大 (如果需要)
+            if mono_depth.shape[0] != self.image_height or mono_depth.shape[1] != self.image_width:
+                mono_depth = \
+                F.interpolate(mono_depth[None, None, ...], size=(self.image_height, self.image_width), mode='bilinear',
+                              align_corners=False)[0, 0]
+
+            # 归一化处理 (建议归一化到 0-1 或标准化，这取决于你后面怎么对齐)
+            # mono_depth = (mono_depth - mono_depth.min()) / (mono_depth.max() - mono_depth.min() + 1e-5)
+
+            self.mono_depth_image = mono_depth.to(data_device)
 
 
 class MiniCam:

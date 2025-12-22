@@ -35,6 +35,31 @@ try:
 except ImportError:
     TENSORBOARD_FOUND = False
 
+#ljx:深度图尺度对齐
+def align_depth(mono_depth, render_depth, mask):
+    """
+    使用最小二乘法将 mono_depth 对齐到 render_depth (scale * mono + shift)
+    """
+    # 简单的线性回归对齐
+    render_depth_flat = render_depth[mask]
+    mono_depth_flat = mono_depth[mask]
+
+    if len(render_depth_flat) < 10:
+        return mono_depth  # 样本太少不处理
+
+    # Stack columns for linear system: A = [mono, 1]
+    A = torch.stack([mono_depth_flat, torch.ones_like(mono_depth_flat)], dim=1)
+
+    # Solve Ax = b (b = render) using least squares
+    # x = (A^T A)^-1 A^T b
+    try:
+        X = torch.linalg.lstsq(A, render_depth_flat).solution
+        scale, shift = X[0], X[1]
+    except:
+        scale, shift = 1.0, 0.0
+
+    aligned_mono = mono_depth * scale + shift
+    return aligned_mono
 
 def render_normal(viewpoint_cam, depth, offset=None, normal=None, scale=1):
     # depth: (H, W), bg_color: (3), alpha: (H, W)
@@ -287,8 +312,8 @@ def training(
         viewspace_point_tensor = rendering_result["viewspace_points"]
         visibility_filter = rendering_result["visibility_filter"]
         radii = rendering_result["radii"]
-        normal_map_from_depth = rendering_result["normal_map_from_depth"]  # [3, H, W]
-        normal_map = rendering_result["normal_map"]  # [3, H, W]
+        normal_map_from_depth = rendering_result["normal_map_from_depth"]  # [3, H, W]  根据深度图导出的法线图
+        normal_map = rendering_result["normal_map"]  # [3, H, W] 法线属性渲染出的G-Buffer
         albedo_map = rendering_result["albedo_map"]  # [3, H, W]
         roughness_map = rendering_result["roughness_map"]  # [1, H, W]
         metallic_map = rendering_result["metallic_map"]  # [1, H, W]
@@ -320,11 +345,44 @@ def training(
             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
 
             normal_loss_weight = 1.0
-            mask = rendering_result["normal_from_depth_mask"] 
+            mask = rendering_result["normal_from_depth_mask"]
+            # rendering_result["normal_map"] 是高斯显式优化的法线
+            # rendering_result["normal_map_from_depth"] 是渲染深度算出来的几何法线
             normal_loss = F.l1_loss(normal_map[:, mask], normal_map_from_depth[:, mask])
             loss += normal_loss_weight * normal_loss
             normal_tv_loss = get_tv_loss(gt_image, normal_map, pad=1, step=1)
             loss += normal_tv_loss * normal_tv_weight
+
+            # >>>>> 新增: Depth Anything 法线监督 <<<<<
+            # 只有当相机加载了单目深度图时才计算
+            if hasattr(viewpoint_cam, 'mono_depth_image') and viewpoint_cam.mono_depth_image is not None:
+                mono_depth = viewpoint_cam.mono_depth_image
+                render_depth = rendering_result["depth_map"]  # 确保渲染器返回了 depth_map
+
+                # 1. 深度对齐 (可选，但推荐)
+                # 使用 mask 过滤掉无效区域
+                valid_mask = (mono_depth > 0) & mask.squeeze()
+                aligned_mono_depth = align_depth(mono_depth, render_depth.squeeze(), valid_mask)
+
+                # 2. 将对齐后的单目深度转换为法线
+                # 复用代码中已有的 render_normal 函数 (实际上调用 utils.graphics_utils.normal_from_depth_image)
+                # 注意：render_normal 期望输入是 (H, W)
+                mono_normal = render_normal(viewpoint_cam, aligned_mono_depth)
+
+                # 3. 计算 Loss
+                # 这里的策略是：让高斯的“显式法线 (normal_map)” 去拟合 “Depth Anything的法线”
+                # 或者让“渲染深度导出的几何法线 (normal_map_from_depth)” 去拟合它
+                # GI-GS 中 normal_map 是主要优化的材质属性，建议监督 normal_map
+
+                # 也可以使用 Cosine Similarity Loss，但 L1 也是常用的
+                loss_mono_normal = F.l1_loss(normal_map[:, valid_mask], mono_normal[:, valid_mask])
+
+                # 从 args 获取权重 (需要在函数参数里传进来 或者 使用全局 args)
+                # 这里假设你把 args.lambda_mono 传进了 training 函数，或者写死测试
+                lambda_mono = getattr(opt, "lambda_mono", 0.1)
+
+                loss += lambda_mono * loss_mono_normal
+            # >>>>> 结束新增 <<<<<
 
         else:  # NOTE: PBR
             # recon occlusion
@@ -857,6 +915,8 @@ if __name__ == "__main__":
     parser.add_argument("--gamma", action="store_true", help="Enable linear_to_sRGB for gamma correction.")
     parser.add_argument("--metallic", action="store_true", help="Enable metallic material reconstruction.")
     parser.add_argument("--indirect", action="store_true", help="Enable indirect diffuse modeling.")
+    #ljx:单目深度 损失函数权重参数
+    parser.add_argument("--lambda_mono", default=0.1, type=float, help="Weight for mono-depth normal supervision")
     args = parser.parse_args(sys.argv[1:])
     args.test_iterations.append(args.iterations)
     args.save_iterations.append(args.iterations)

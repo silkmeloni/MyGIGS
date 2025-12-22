@@ -44,6 +44,7 @@ class CameraInfo(NamedTuple):
     image_name: str
     width: int
     height: int
+    depth_mono_path: str #ljx，da2的单目深度路径
 
 
 class SceneInfo(NamedTuple):
@@ -115,6 +116,17 @@ def readColmapCameras(
         image_name = os.path.basename(image_path).split(".")[0]
         image = Image.open(image_path)
 
+        #ljx:读取da2单目深度图
+        # dirname是images的上一级也就是root，da2和images是同级关系
+        depth_folder = os.path.join(os.path.dirname(images_folder), "da2")
+        #需保证深度图文件名和原图完全一致：
+        depth_mono_path = os.path.join(depth_folder, os.path.basename(extr.name))
+        # 如果原图是jpg，深度图是png，需要替换后缀：
+        depth_mono_path = os.path.join(depth_folder, os.path.basename(extr.name).replace(".jpg", ".png"))
+        if not os.path.exists(depth_mono_path):
+            print(f"Warning: Depth map not found at {depth_mono_path}")
+
+
         cam_info = CameraInfo(
             uid=uid,
             R=R,
@@ -126,6 +138,7 @@ def readColmapCameras(
             image_name=image_name,
             width=width,
             height=height,
+            depth_mono_path=depth_mono_path,  # <--- 传入路径
         )
         cam_infos.append(cam_info)
     sys.stdout.write("\n")
