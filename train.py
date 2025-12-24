@@ -341,6 +341,7 @@ def training(
         loss: torch.Tensor
         Ll1 = F.l1_loss(image, gt_image)
         normal_loss = 0.0
+        mono_loss = 0.0
         if iteration <= pbr_iteration:
             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
 
@@ -355,7 +356,10 @@ def training(
 
             # >>>>> 新增: Depth Anything 法线监督 <<<<<
             # 只有当相机加载了单目深度图时才计算
-            if hasattr(viewpoint_cam, 'mono_depth_image') and viewpoint_cam.mono_depth_image is not None:
+            use_mono_depth = getattr(dataset, "use_mono_depth", False)  # 从 dataset 参数组获取，或者从 opt 获取
+
+            # 或者直接判断 lambda_mono > 0 且 viewpoint_cam 有数据
+            if use_mono_depth and hasattr(viewpoint_cam,'mono_depth_image') and viewpoint_cam.mono_depth_image is not None:
                 mono_depth = viewpoint_cam.mono_depth_image
                 render_depth = rendering_result["depth_map"]  # 确保渲染器返回了 depth_map
 
@@ -376,6 +380,7 @@ def training(
 
                 # 也可以使用 Cosine Similarity Loss，但 L1 也是常用的
                 loss_mono_normal = F.l1_loss(normal_map[:, valid_mask], mono_normal[:, valid_mask])
+                mono_loss = lambda_mono
 
                 # 从 args 获取权重 (需要在函数参数里传进来 或者 使用全局 args)
                 # 这里假设你把 args.lambda_mono 传进了 training 函数，或者写死测试
@@ -483,10 +488,26 @@ def training(
 
         with torch.no_grad():
             # Progress bar
-            # ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             if iteration % 10 == 0:
-                progress_bar.set_postfix({"Loss": f"{loss.item():.{7}f}"})
+                # 1. 准备 loss 数值
+                if isinstance(normal_loss, torch.Tensor):
+                    normal_loss_val = normal_loss.item()
+                else:
+                    normal_loss_val = normal_loss
+
+                loss_log = {
+                    "Loss": f"{loss.item():.{5}f}",
+                    "Org_N": f"{normal_loss_val:.{5}f}"
+                }
+
+                # 2. 如果开启深度先验，往字典里加一项
+                if use_mono_depth:
+                    loss_log["New_D"] = f"{mono_loss_val:.{5}f}"
+
+                # 3. 更新进度条 (注意这里的缩进，必须在 if use_mono_depth 外面)
+                progress_bar.set_postfix(loss_log)
                 progress_bar.update(10)
+
             if iteration == opt.iterations:
                 progress_bar.close()
 
@@ -916,7 +937,7 @@ if __name__ == "__main__":
     parser.add_argument("--metallic", action="store_true", help="Enable metallic material reconstruction.")
     parser.add_argument("--indirect", action="store_true", help="Enable indirect diffuse modeling.")
     #ljx:单目深度 损失函数权重参数
-    parser.add_argument("--lambda_mono", default=0.1, type=float, help="Weight for mono-depth normal supervision")
+    parser.add_argument("--lambda_mono", default=0.0, type=float, help="Weight for mono-depth normal supervision")
     args = parser.parse_args(sys.argv[1:])
     args.test_iterations.append(args.iterations)
     args.save_iterations.append(args.iterations)

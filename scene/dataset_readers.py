@@ -80,7 +80,7 @@ def getNerfppNorm(cam_info: List[CameraInfo]) -> Dict:
 
 
 def readColmapCameras(
-    cam_extrinsics: Dict, cam_intrinsics: Dict, images_folder: str
+    cam_extrinsics: Dict, cam_intrinsics: Dict, images_folder: str,use_mono_depth=False
 ) -> List[CameraInfo]:
     cam_infos = []
     for idx, key in enumerate(cam_extrinsics):
@@ -117,14 +117,14 @@ def readColmapCameras(
         image = Image.open(image_path)
 
         #ljx:读取da2单目深度图
-        # dirname是images的上一级也就是root，da2和images是同级关系
-        depth_folder = os.path.join(os.path.dirname(images_folder), "da2")
-        #需保证深度图文件名和原图完全一致：
-        depth_mono_path = os.path.join(depth_folder, os.path.basename(extr.name))
-        # 如果原图是jpg，深度图是png，需要替换后缀：
-        depth_mono_path = os.path.join(depth_folder, os.path.basename(extr.name).replace(".jpg", ".png"))
-        if not os.path.exists(depth_mono_path):
-            print(f"Warning: Depth map not found at {depth_mono_path}")
+        depth_mono_path = None  # 默认为 None
+        if use_mono_depth:  # 只有开启了参数，才去拼凑路径
+            # dirname是images的上一级也就是root，da2和images是同级关系
+            depth_folder = os.path.join(os.path.dirname(images_folder), "da2")
+            # 如果原图是jpg，深度图是png，需要替换后缀：
+            depth_mono_path = os.path.join(depth_folder, os.path.basename(extr.name).replace(".jpg", ".png"))
+            if not os.path.exists(depth_mono_path):
+                print(f"Warning: Depth map not found at {depth_mono_path}")
 
 
         cam_info = CameraInfo(
@@ -180,7 +180,7 @@ def storePly(path: str, xyz: np.ndarray, rgb: np.ndarray) -> None:
     ply_data.write(path)
 
 
-def readColmapSceneInfo(path: str, images: str, eval: bool, llffhold: int = 8) -> SceneInfo:
+def readColmapSceneInfo(path: str, images: str, eval: bool, llffhold: int = 8,use_mono_depth=False) -> SceneInfo:
     try:
         cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
         cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
@@ -193,10 +193,12 @@ def readColmapSceneInfo(path: str, images: str, eval: bool, llffhold: int = 8) -
         cam_intrinsics = read_intrinsics_text(cameras_intrinsic_file)
 
     reading_dir = "images" if images == None else images
+
     cam_infos_unsorted = readColmapCameras(
         cam_extrinsics=cam_extrinsics,
         cam_intrinsics=cam_intrinsics,
         images_folder=os.path.join(path, reading_dir),
+        use_mono_depth=use_mono_depth,
     )
     cam_infos = sorted(cam_infos_unsorted.copy(), key=lambda x: x.image_name)
 
@@ -285,6 +287,7 @@ def readCamerasFromTransforms(
                 image_name=image_name,
                 width=image.size[0],
                 height=image.size[1],
+                depth_mono_path=None,  # <--- 传入路径
             )
         )
 
