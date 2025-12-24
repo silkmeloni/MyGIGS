@@ -19,6 +19,39 @@ from utils.graphics_utils import getProjectionMatrix, getWorld2View2
 
 
 class Camera(nn.Module):
+    # ... 在 Camera 类内部 ...
+
+    def get_calib_matrix_nerf(self, scale=1.0):
+        """
+        获取 NeRF 格式的内参和外参矩阵，用于法线渲染等计算。
+        """
+        # 根据 FoV 计算焦距
+        # 注意：这里基于当前的图像分辨率 self.image_width/height
+        # 如果传入了 scale，则对分辨率进行缩放
+        W = self.image_width * scale
+        H = self.image_height * scale
+
+        # fx = W / (2 * tan(fovx / 2))
+        focal_x = W / (2.0 * np.tan(self.FoVx * 0.5))
+        focal_y = H / (2.0 * np.tan(self.FoVy * 0.5))
+
+        # 假设主点在图像中心
+        cx = W / 2.0
+        cy = H / 2.0
+
+        # 构建内参矩阵 (3x3)
+        intrinsic_matrix = torch.tensor([
+            [focal_x, 0, cx],
+            [0, focal_y, cy],
+            [0, 0, 1]
+        ], dtype=torch.float32, device=self.data_device)
+
+        # 获取外参矩阵 (World-to-Camera)
+        # 3DGS 存储的 world_view_transform 通常是转置过的 (Column-major)，我们需要转回来
+        extrinsic_matrix = self.world_view_transform.transpose(0, 1)
+
+        return intrinsic_matrix, extrinsic_matrix
+
     def __init__(
         self,
         colmap_id: int,

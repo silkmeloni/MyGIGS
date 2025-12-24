@@ -82,6 +82,7 @@ def getNerfppNorm(cam_info: List[CameraInfo]) -> Dict:
 def readColmapCameras(
     cam_extrinsics: Dict, cam_intrinsics: Dict, images_folder: str,use_mono_depth=False
 ) -> List[CameraInfo]:
+    print("执行了readColmapCameras")
     cam_infos = []
     for idx, key in enumerate(cam_extrinsics):
         sys.stdout.write("\r")
@@ -125,6 +126,8 @@ def readColmapCameras(
             depth_mono_path = os.path.join(depth_folder, os.path.basename(extr.name).replace(".jpg", ".png"))
             if not os.path.exists(depth_mono_path):
                 print(f"Warning: Depth map not found at {depth_mono_path}")
+            else:
+                print(f"find Depth map at {depth_mono_path}!")
 
 
         cam_info = CameraInfo(
@@ -181,6 +184,7 @@ def storePly(path: str, xyz: np.ndarray, rgb: np.ndarray) -> None:
 
 
 def readColmapSceneInfo(path: str, images: str, eval: bool, llffhold: int = 8,use_mono_depth=False) -> SceneInfo:
+    print("执行了readColmapSceneInfo")
     try:
         cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
         cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
@@ -239,6 +243,7 @@ def readColmapSceneInfo(path: str, images: str, eval: bool, llffhold: int = 8,us
 def readCamerasFromTransforms(
     path: str, transformsfile: str, white_background: bool, extension: str = ".png"
 ) -> List[CameraInfo]:
+    print("执行了readCamerasFromTransforms")
     cam_infos = []
 
     with open(os.path.join(path, transformsfile)) as json_file:
@@ -297,6 +302,7 @@ def readCamerasFromTransforms(
 def readNerfSyntheticInfo(
     path: str, white_background: bool, eval: bool, extension: str = ".png"
 ) -> SceneInfo:
+    print("执行了readNerfSyntheticInfo")
     print("Reading Training Transforms")
     train_cam_infos = readCamerasFromTransforms(
         path, "transforms_train.json", white_background, extension

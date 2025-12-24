@@ -36,30 +36,54 @@ except ImportError:
     TENSORBOARD_FOUND = False
 
 #ljx:深度图尺度对齐
-def align_depth(mono_depth, render_depth, mask):
+def align_depth_robust(mono_depth, render_depth, mask):
     """
-    使用最小二乘法将 mono_depth 对齐到 render_depth (scale * mono + shift)
+    基于逆深度（视差）的鲁棒对齐 (Median / MAD)
+    参考用户提供的 scale estimation 脚本
     """
-    # 简单的线性回归对齐
-    render_depth_flat = render_depth[mask]
-    mono_depth_flat = mono_depth[mask]
+    # 1. 转换为视差 (Disparity = 1 / Depth)
+    # 加上 eps 防止除零
+    eps = 1e-6
+    # 假设 mono_depth 和 render_depth 都是线性深度 (Linear Depth)
+    disp_mono = 1.0 / (mono_depth + eps)
+    disp_render = 1.0 / (render_depth + eps)
 
-    if len(render_depth_flat) < 10:
-        return mono_depth  # 样本太少不处理
+    # 2. 筛选有效区域 (Mask)
+    # 确保深度值为正且有限
+    valid_mask = mask & (mono_depth > eps) & (render_depth > eps) & \
+                 torch.isfinite(disp_mono) & torch.isfinite(disp_render)
 
-    # Stack columns for linear system: A = [mono, 1]
-    A = torch.stack([mono_depth_flat, torch.ones_like(mono_depth_flat)], dim=1)
+    if valid_mask.sum() < 10:
+        return mono_depth  # 样本过少，不处理
 
-    # Solve Ax = b (b = render) using least squares
-    # x = (A^T A)^-1 A^T b
-    try:
-        X = torch.linalg.lstsq(A, render_depth_flat).solution
-        scale, shift = X[0], X[1]
-    except:
-        scale, shift = 1.0, 0.0
+    dm_masked = disp_mono[valid_mask]
+    dr_masked = disp_render[valid_mask]
 
-    aligned_mono = mono_depth * scale + shift
-    return aligned_mono
+    # 3. 计算统计量 (Median & Mean Absolute Deviation)
+    t_mono = torch.median(dm_masked)
+    s_mono = torch.mean(torch.abs(dm_masked - t_mono))
+
+    t_render = torch.median(dr_masked)
+    s_render = torch.mean(torch.abs(dr_masked - t_render))
+
+    # 4. 计算 Scale 和 Offset
+    # 目标: disp_render approx scale * disp_mono + offset
+    if s_mono < 1e-7:
+        scale = 1.0
+        offset = 0.0
+    else:
+        scale = s_render / s_mono
+        offset = t_render - scale * t_mono
+
+    # 5. 应用对齐 (在视差空间)
+    aligned_disp = scale * disp_mono + offset
+
+    # 6. 转回深度空间
+    # 处理负视差或极小值 (对应无限远或错误点)，截断到非常远但有限的深度
+    aligned_disp = torch.clamp(aligned_disp, min=eps)
+    aligned_mono_depth = 1.0 / aligned_disp
+
+    return aligned_mono_depth
 
 def render_normal(viewpoint_cam, depth, offset=None, normal=None, scale=1):
     # depth: (H, W), bg_color: (3), alpha: (H, W)
@@ -341,7 +365,23 @@ def training(
         loss: torch.Tensor
         Ll1 = F.l1_loss(image, gt_image)
         normal_loss = 0.0
-        mono_loss = 0.0
+        loss_mono_normal = 0.0
+        lambda_mono = getattr(opt, "lambda_mono", 0.1)
+
+        # ==========================================
+        # 调试代码：在第 100 次迭代打印一下状态，看看是哪一步断了
+        if iteration == 100:
+            print(f"\n[Debug] Iter={iteration}")
+            print(f"  use_mono_depth: {use_mono_depth}")
+            print(f"  lambda_mono: {lambda_mono}")
+            has_img = hasattr(viewpoint_cam, 'mono_depth_image')
+            print(f"  has_mono_attr: {has_img}")
+            if has_img:
+                print(f"  img_is_not_None: {viewpoint_cam.mono_depth_image is not None}")
+                if viewpoint_cam.mono_depth_image is not None:
+                    print(f"  img_shape: {viewpoint_cam.mono_depth_image.shape}")
+
+
         if iteration <= pbr_iteration:
             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
 
@@ -355,7 +395,6 @@ def training(
             loss += normal_tv_loss * normal_tv_weight
 
             # >>>>> 新增: Depth Anything 法线监督 <<<<<
-            # 只有当相机加载了单目深度图时才计算
             use_mono_depth = getattr(dataset, "use_mono_depth", False)  # 从 dataset 参数组获取，或者从 opt 获取
 
             # 或者直接判断 lambda_mono > 0 且 viewpoint_cam 有数据
@@ -366,25 +405,15 @@ def training(
                 # 1. 深度对齐 (可选，但推荐)
                 # 使用 mask 过滤掉无效区域
                 valid_mask = (mono_depth > 0) & mask.squeeze()
-                aligned_mono_depth = align_depth(mono_depth, render_depth.squeeze(), valid_mask)
+                aligned_mono_depth = align_depth_robust(mono_depth, render_depth.squeeze(), valid_mask)
 
                 # 2. 将对齐后的单目深度转换为法线
-                # 复用代码中已有的 render_normal 函数 (实际上调用 utils.graphics_utils.normal_from_depth_image)
                 # 注意：render_normal 期望输入是 (H, W)
                 mono_normal = render_normal(viewpoint_cam, aligned_mono_depth)
 
-                # 3. 计算 Loss
-                # 这里的策略是：让高斯的“显式法线 (normal_map)” 去拟合 “Depth Anything的法线”
-                # 或者让“渲染深度导出的几何法线 (normal_map_from_depth)” 去拟合它
-                # GI-GS 中 normal_map 是主要优化的材质属性，建议监督 normal_map
-
-                # 也可以使用 Cosine Similarity Loss，但 L1 也是常用的
+                # 3. 计算 Loss  让高斯的“显式法线 (normal_map)” 去拟合 “Depth Anything的法线”
                 loss_mono_normal = F.l1_loss(normal_map[:, valid_mask], mono_normal[:, valid_mask])
-                mono_loss = lambda_mono
 
-                # 从 args 获取权重 (需要在函数参数里传进来 或者 使用全局 args)
-                # 这里假设你把 args.lambda_mono 传进了 training 函数，或者写死测试
-                lambda_mono = getattr(opt, "lambda_mono", 0.1)
 
                 loss += lambda_mono * loss_mono_normal
             # >>>>> 结束新增 <<<<<
@@ -495,6 +524,11 @@ def training(
                 else:
                     normal_loss_val = normal_loss
 
+                if isinstance(loss_mono_normal, torch.Tensor):
+                    loss_mono_normal_val = loss_mono_normal.item()
+                else:
+                    loss_mono_normal_val = loss_mono_normal
+
                 loss_log = {
                     "Loss": f"{loss.item():.{5}f}",
                     "Org_N": f"{normal_loss_val:.{5}f}"
@@ -502,11 +536,79 @@ def training(
 
                 # 2. 如果开启深度先验，往字典里加一项
                 if use_mono_depth:
-                    loss_log["New_D"] = f"{mono_loss_val:.{5}f}"
+                    loss_log["New_D"] = f"{loss_mono_normal_val:.{5}f}"
 
                 # 3. 更新进度条 (注意这里的缩进，必须在 if use_mono_depth 外面)
                 progress_bar.set_postfix(loss_log)
                 progress_bar.update(10)
+
+             # === 【新增】可视化调试代码 ===
+            # 每 500 次迭代，且当开启深度先验时，记录深度对齐情况到 Tensorboard
+            if use_mono_depth and iteration % 500 == 0:
+                if tb_writer is not None and 'aligned_mono_depth' in locals():
+                    with torch.no_grad():
+                        # 1. 准备数据
+                        # 辅助函数: 确保 tensor 转为 numpy 前在 cpu，返回的 tensor 也在 cpu
+                        def to_cmap(tensor):
+                            x = tensor.detach().cpu().numpy().squeeze()
+                            # 注意：确保 turbo_cmap 已定义或导入，如果报错未定义，请检查 utils 引用
+                            # 假设 turbo_cmap 返回 (H, W, 3) 且值域 0-1 或 0-255
+                            # 如果没有 turbo_cmap，可以用简单的 matplotlib colormap 替代
+                            try:
+                                # 尝试调用 utils 中的 turbo_cmap
+                                from utils.general_utils import turbo_cmap
+                                cmap = turbo_cmap(x)
+                            except:
+                                # 简单的备用方案 (黑白)
+                                x_norm = (x - x.min()) / (x.max() - x.min() + 1e-5)
+                                cmap = np.stack([x_norm] * 3, axis=-1)
+
+                            return torch.from_numpy(cmap).permute(2, 0, 1).float().cpu()
+
+                        # 渲染深度 (Rendered Depth) -> CPU
+                        viz_render = to_cmap(render_depth)
+
+                        # 原始单目深度 (Original Mono) -> CPU
+                        viz_mono_raw = to_cmap(mono_depth)
+
+                        # 对齐后的单目深度 (Aligned Mono) -> CPU
+                        viz_mono_aligned = to_cmap(aligned_mono_depth)
+
+                        # 误差图 (L1 Error)
+                        # diff 计算是在 GPU 上进行的 (因为 render_depth 在 GPU)
+                        diff = torch.abs(aligned_mono_depth - render_depth.squeeze())
+                        diff = diff / (diff.mean() * 5.0 + 1e-6)
+                        diff = torch.clamp(diff, 0, 1)
+
+                        # 【关键修改】: 将 GPU 的 diff 转到 CPU
+                        diff_cpu = diff.detach().cpu()
+                        viz_diff = torch.stack([diff_cpu, diff_cpu, diff_cpu], dim=0)  # (3, H, W)
+
+                        # 2. 写入 Tensorboard (现在所有变量都在 CPU 了)
+                        # 拼接在一起: [Render | Mono Raw | Mono Aligned | Error]
+                        # 确保尺寸一致再拼接 (防止 resize 导致的微小差异)
+                        min_h = min(viz_render.shape[1], viz_mono_raw.shape[1])
+                        min_w = min(viz_render.shape[2], viz_mono_raw.shape[2])
+
+                        grid = torch.cat([
+                            viz_render[:, :min_h, :min_w],
+                            viz_mono_raw[:, :min_h, :min_w],
+                            viz_mono_aligned[:, :min_h, :min_w],
+                            viz_diff[:, :min_h, :min_w]
+                        ], dim=2)
+
+                        tb_writer.add_image("Debug_Depth/Render_Raw_Aligned_Diff", grid, iteration)
+
+                        # 3. 记录对齐后的法线对比 (如果有 mono_normal)
+                        if 'mono_normal' in locals():
+                            # normal 是 (3, H, W)，值域 [-1, 1]，转为 [0, 1] 显示
+                            # 【关键修改】: 确保都转到 CPU
+                            viz_n_render = (normal_map.detach().cpu() + 1) / 2
+                            viz_n_mono = (mono_normal.detach().cpu() + 1) / 2
+
+                            grid_norm = torch.cat([viz_n_render, viz_n_mono], dim=2)
+                            tb_writer.add_image("Debug_Normal/Render_vs_Mono", grid_norm, iteration)
+                # ===============================
 
             if iteration == opt.iterations:
                 progress_bar.close()
@@ -952,6 +1054,7 @@ if __name__ == "__main__":
     # with torch.autograd.detect_anomaly():
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
     dataset = lp.extract(args)
+    dataset.use_mono_depth = args.use_mono_depth
     dataset.sh_degree = args.degree
     training(
         dataset=dataset,
