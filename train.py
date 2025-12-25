@@ -382,10 +382,18 @@ def training(
                     print(f"  img_shape: {viewpoint_cam.mono_depth_image.shape}")
 
 
+
         if iteration <= pbr_iteration:
             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+            # >>>>> 新增: Depth Anything 法线监督 <<<<<
+            use_mono_depth = getattr(dataset, "use_mono_depth", False)  # 从 dataset 参数组获取，或者从 opt 获取
 
-            normal_loss_weight = 1.0
+            # === 修改 1: 如果开启深度先验，禁用或降低原始几何约束 ===
+            if use_mono_depth:
+                normal_loss_weight = 0.0  # 或者 0.01，保留一点点约束
+            else:
+                normal_loss_weight = 1.0
+
             mask = rendering_result["normal_from_depth_mask"]
             # rendering_result["normal_map"] 是高斯显式优化的法线
             # rendering_result["normal_map_from_depth"] 是渲染深度算出来的几何法线
@@ -394,8 +402,46 @@ def training(
             normal_tv_loss = get_tv_loss(gt_image, normal_map, pad=1, step=1)
             loss += normal_tv_loss * normal_tv_weight
 
-            # >>>>> 新增: Depth Anything 法线监督 <<<<<
-            use_mono_depth = getattr(dataset, "use_mono_depth", False)  # 从 dataset 参数组获取，或者从 opt 获取
+
+
+            # >>>>> 修改后的 Depth Anything 监督逻辑 <<<<<
+            # if use_mono_depth and lambda_mono > 0:
+            #     if hasattr(viewpoint_cam, 'mono_depth_image') and viewpoint_cam.mono_depth_image is not None:
+            #         mono_depth = viewpoint_cam.mono_depth_image
+            #         render_depth = rendering_result["depth_map"]
+            #
+            #         # 使用 GT Alpha Mask 剔除背景 (非常重要!)
+            #         gt_alpha_mask = (viewpoint_cam.gt_alpha_mask.cuda().squeeze() > 0.5)
+            #         valid_mask = (mono_depth > 0) & mask.squeeze() & gt_alpha_mask
+            #
+            #         if valid_mask.sum() > 10:
+            #             # 1. 深度对齐 (注意 render_depth 依然需要 detach 来计算 scale/shift)
+            #             # 我们希望 scale/shift 是根据当前状态算出来的一个定值
+            #             aligned_mono_depth = align_depth_robust(
+            #                 mono_depth,
+            #                 render_depth.squeeze().detach(),
+            #                 valid_mask
+            #             )
+            #
+            #             # 2. === 核心改变：直接监督深度 ===
+            #             # 让 3DGS 的渲染深度 去逼近 对齐后的单目深度
+            #
+            #             # L1 Loss
+            #             loss_depth_l1 = F.l1_loss(
+            #                 render_depth.squeeze()[valid_mask],
+            #                 aligned_mono_depth[valid_mask]
+            #             )
+            #
+            #             # (可选) SSIM Loss: 对于深度监督通常很有用，能保持结构
+            #             # 需要先把 masked 区域还原回图片形状才能算 ssim，略麻烦，先只用 L1 试试
+            #
+            #             # 最终 Loss
+            #             # 注意：深度通常数值较小，权重可能需要加大，比如 lambda_mono 设为 0.5 或 1.0
+            #             loss += lambda_mono * loss_depth_l1
+            #
+            #             # 用于显示
+            #             loss_mono_normal = loss_depth_l1  # 变量名借用一下以免改进度条代码
+            # >>>>> 结束 <<<<<
 
             if use_mono_depth and hasattr(viewpoint_cam,'mono_depth_image') and viewpoint_cam.mono_depth_image is not None:
                 mono_depth = viewpoint_cam.mono_depth_image
@@ -424,7 +470,7 @@ def training(
                     loss_mono_normal = F.l1_loss(normal_map[:, valid_mask], mono_normal[:, valid_mask])
                     loss += lambda_mono * loss_mono_normal
 
-            # >>>>> 结束新增 <<<<<
+            # # >>>>> 结束新增 <<<<<
 
         else:  # NOTE: PBR
             # recon occlusion
