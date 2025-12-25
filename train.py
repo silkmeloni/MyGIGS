@@ -368,22 +368,15 @@ def training(
         loss_mono_normal = 0.0
         lambda_mono = getattr(opt, "lambda_mono", 0.1)
 
-        # ==========================================
-        # 调试代码：在第 100 次迭代打印一下状态，看看是哪一步断了
-        if iteration == 100:
-            print(f"\n[Debug] Iter={iteration}")
-            print(f"  use_mono_depth: {use_mono_depth}")
-            print(f"  lambda_mono: {lambda_mono}")
-            has_img = hasattr(viewpoint_cam, 'mono_depth_image')
-            print(f"  has_mono_attr: {has_img}")
-            if has_img:
-                print(f"  img_is_not_None: {viewpoint_cam.mono_depth_image is not None}")
-                if viewpoint_cam.mono_depth_image is not None:
-                    print(f"  img_shape: {viewpoint_cam.mono_depth_image.shape}")
 
-
-
-        if iteration <= pbr_iteration:
+        if iteration <= 3000: #第一阶段：纯几何，让物体长出轮廓
+            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+            normal_loss_weight = 1.0
+            normal_loss = F.l1_loss(normal_map[:, mask], normal_map_from_depth[:, mask])
+            loss += normal_loss_weight * normal_loss
+            normal_tv_loss = get_tv_loss(gt_image, normal_map, pad=1, step=1)
+            loss += normal_tv_loss * normal_tv_weight
+        elif iteration <= pbr_iteration:
             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
             # >>>>> 新增: Depth Anything 法线监督 <<<<<
             use_mono_depth = getattr(dataset, "use_mono_depth", False)
