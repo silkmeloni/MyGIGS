@@ -286,6 +286,9 @@ def training(
     viewpoint_stack = None
     ema_loss_for_log = 0.0
     progress_bar = trange(first_iter, opt.iterations, desc="Training progress")  # For logging
+    use_mono_depth = getattr(dataset, "use_mono_depth", False)
+
+
     for iteration in range(first_iter + 1, opt.iterations + 1):  # the real iteration (1 shift)
         iter_start.record()
         # Every 1000 its we increase the levels of SH up to a maximum degree
@@ -372,6 +375,7 @@ def training(
         if iteration <= 3000: #第一阶段：纯几何，让物体长出轮廓
             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
             normal_loss_weight = 1.0
+            mask = rendering_result["normal_from_depth_mask"]
             normal_loss = F.l1_loss(normal_map[:, mask], normal_map_from_depth[:, mask])
             loss += normal_loss_weight * normal_loss
             normal_tv_loss = get_tv_loss(gt_image, normal_map, pad=1, step=1)
@@ -379,7 +383,6 @@ def training(
         elif iteration <= pbr_iteration:
             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
             # >>>>> 新增: Depth Anything 法线监督 <<<<<
-            use_mono_depth = getattr(dataset, "use_mono_depth", False)
             mask = rendering_result["normal_from_depth_mask"]
 
             # === 修改 1: 如果开启深度先验，禁用或降低原始几何约束 ===
