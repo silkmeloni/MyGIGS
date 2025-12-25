@@ -397,25 +397,33 @@ def training(
             # >>>>> 新增: Depth Anything 法线监督 <<<<<
             use_mono_depth = getattr(dataset, "use_mono_depth", False)  # 从 dataset 参数组获取，或者从 opt 获取
 
-            # 或者直接判断 lambda_mono > 0 且 viewpoint_cam 有数据
             if use_mono_depth and hasattr(viewpoint_cam,'mono_depth_image') and viewpoint_cam.mono_depth_image is not None:
                 mono_depth = viewpoint_cam.mono_depth_image
                 render_depth = rendering_result["depth_map"]  # 确保渲染器返回了 depth_map
 
-                # 1. 深度对齐 (可选，但推荐)
-                # 使用 mask 过滤掉无效区域
-                valid_mask = (mono_depth > 0) & mask.squeeze()
-                aligned_mono_depth = align_depth_robust(mono_depth, render_depth.squeeze(), valid_mask)
+                # === 【核心修改】引入 GT Alpha Mask ===
+                # 获取数据集自带的 Alpha Mask (1, H, W) -> (H, W)
+                # 放到 GPU 并二值化 (阈值 0.5)
+                gt_alpha_mask = (viewpoint_cam.gt_alpha_mask.cuda().squeeze() > 0.5)
 
-                # 2. 将对齐后的单目深度转换为法线
-                # 注意：render_normal 期望输入是 (H, W)
-                mono_normal = render_normal(viewpoint_cam, aligned_mono_depth)
+                # 更新 valid_mask 的逻辑：
+                # 1. mono_depth > 0: 单目深度图有值
+                # 2. mask.squeeze(): 当前渲染出的几何法线有效 (原有逻辑)
+                # 3. gt_alpha_mask: 只在真值掩膜范围内计算 (剔除背景!)
+                valid_mask = (mono_depth > 0) & mask.squeeze() & gt_alpha_mask
+                # ====================================
 
-                # 3. 计算 Loss  让高斯的“显式法线 (normal_map)” 去拟合 “Depth Anything的法线”
-                loss_mono_normal = F.l1_loss(normal_map[:, valid_mask], mono_normal[:, valid_mask])
+                # 加上数量判断，防止 mask 全黑导致报错
+                if valid_mask.sum() > 10:
+                    # 1. 深度对齐 (现在的 Scale/Shift 只会由物体区域决定，非常准确) 必须有detach，防止反过来去改单目深度
+                    aligned_mono_depth = align_depth_robust(mono_depth, render_depth.squeeze().detach(), valid_mask)
+                    # 2. 转法线 # 双重保险：确保作为 Target 的法线也是 detach 的
+                    mono_normal = render_normal(viewpoint_cam, aligned_mono_depth)
+                    mono_normal = mono_normal.detach()
+                    # 3. 计算 Loss (只优化物体部分的法线)
+                    loss_mono_normal = F.l1_loss(normal_map[:, valid_mask], mono_normal[:, valid_mask])
+                    loss += lambda_mono * loss_mono_normal
 
-
-                loss += lambda_mono * loss_mono_normal
             # >>>>> 结束新增 <<<<<
 
         else:  # NOTE: PBR
@@ -541,6 +549,19 @@ def training(
                 # 3. 更新进度条 (注意这里的缩进，必须在 if use_mono_depth 外面)
                 progress_bar.set_postfix(loss_log)
                 progress_bar.update(10)
+
+                # === 【新增】记录 Loss 曲线到 TensorBoard ===
+                if tb_writer is not None:
+                    # 记录总 Loss
+                    tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
+
+                    # 记录原始几何 Loss
+                    tb_writer.add_scalar('train_loss_patches/original_normal_loss', normal_loss_val, iteration)
+
+                    # 记录单目深度监督 Loss (如果开启)
+                    if use_mono_depth:
+                        tb_writer.add_scalar('train_loss_patches/mono_depth_loss', loss_mono_normal_val, iteration)
+                # ==========================================
 
              # === 【新增】可视化调试代码 ===
             # 每 500 次迭代，且当开启深度先验时，记录深度对齐情况到 Tensorboard
