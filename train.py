@@ -551,17 +551,27 @@ def training(
                 progress_bar.set_postfix(loss_log)
                 progress_bar.update(10)
 
-                # === 【新增】记录 Loss 曲线到 TensorBoard ===
-                if tb_writer is not None:
-                    # 记录总 Loss
-                    tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
+                if iteration % 500 == 0:
+                    # 使用 \n 换行，确保这行字会被保留在控制台历史里，方便你训练完回看
+                    # 格式：[Iter 1500] Loss: 0.12345 | Org_N: 0.05000 | New_D: 0.02000
+                    print(
+                        f"\n[Iter {iteration:05d}] "
+                        f"Loss: {loss.item():.5f} | "
+                        f"Org_N: {normal_loss_val:.5f} | "
+                        f"New_D: {loss_mono_normal_val:.5f}"
+                    )
 
-                    # 记录原始几何 Loss
-                    tb_writer.add_scalar('train_loss_patches/original_normal_loss', normal_loss_val, iteration)
-
-                    # 记录单目深度监督 Loss (如果开启)
-                    if use_mono_depth:
-                        tb_writer.add_scalar('train_loss_patches/mono_depth_loss', loss_mono_normal_val, iteration)
+                # # === 【新增】记录 Loss 曲线到 TensorBoard ===
+                # if tb_writer is not None:
+                #     # 记录总 Loss
+                #     tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
+                #
+                #     # 记录原始几何 Loss
+                #     tb_writer.add_scalar('train_loss_patches/original_normal_loss', normal_loss_val, iteration)
+                #
+                #     # 记录单目深度监督 Loss (如果开启)
+                #     if use_mono_depth:
+                #         tb_writer.add_scalar('train_loss_patches/mono_depth_loss', loss_mono_normal_val, iteration)
                 # ==========================================
 
              # === 【新增】可视化调试代码 ===
@@ -631,6 +641,10 @@ def training(
                             grid_norm = torch.cat([viz_n_render, viz_n_mono], dim=2)
                             tb_writer.add_image("Debug_Normal/Render_vs_Mono", grid_norm, iteration)
                 # ===============================
+
+            if iteration in saving_iterations:
+                print(f"\n[INFO] Saving Gaussian model at iteration {iteration}...")
+                scene.save(iteration)
 
             if iteration == opt.iterations:
                 progress_bar.close()
