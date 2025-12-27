@@ -73,14 +73,39 @@ def _get_plugin():
     except:
         pass
 
-    # Compile and load.
-    source_paths = [os.path.join(os.path.dirname(__file__), fn) for fn in source_files]
-    torch.utils.cpp_extension.load(name='renderutils_plugin', sources=source_paths, extra_cflags=opts,
-         extra_cuda_cflags=opts, extra_ldflags=ldflags, with_cuda=True, verbose=True)
+    # # Compile and load.
+    # source_paths = [os.path.join(os.path.dirname(__file__), fn) for fn in source_files]
+    # torch.utils.cpp_extension.load(name='renderutils_plugin', sources=source_paths, extra_cflags=opts,
+    #      extra_cuda_cflags=opts, extra_ldflags=ldflags, with_cuda=True, verbose=True)
+    #
+    # # Import, cache, and return the compiled module.
+    # import renderutils_plugin
+    # _cached_plugin = renderutils_plugin
+    # return _cached_plugin
 
-    # Import, cache, and return the compiled module.
-    import renderutils_plugin
-    _cached_plugin = renderutils_plugin
+    # === 修改后的代码 ===
+    # 1. 构造路径
+    source_paths = [os.path.join(os.path.dirname(__file__), fn) for fn in source_files]
+
+    # 2. 打印一下路径，确保文件真的存在 (调试用)
+    # for p in source_paths:
+    #     if not os.path.exists(p): print(f"!! Missing file: {p}")
+
+    # 3. 编译并直接捕获返回值
+    # 注意：我们把返回值直接赋给 _cached_plugin，而不是忽略返回值再去 import
+    _cached_plugin = torch.utils.cpp_extension.load(
+        name='renderutils_plugin',
+        sources=source_paths,
+        extra_cflags=opts,
+        extra_cuda_cflags=opts,
+        extra_ldflags=ldflags,
+        with_cuda=True,
+        verbose=True
+    )
+
+    # 4. 把那句 import 删掉或者注释掉
+    # import renderutils_plugin
+
     return _cached_plugin
 
 #----------------------------------------------------------------------------
