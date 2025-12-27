@@ -290,6 +290,14 @@ def training(
 
     # === 【新增 1】 初始化早停标志位 ===
     depth_sup_stopped = False  # 用来记录是否已经打印过停止信息
+    # === 【新增】基于 Loss 趋势的动态早停变量 ===
+    depth_sup_enabled = True  # 开关
+    mono_loss_ema = None  # Loss 的平滑值
+    best_mono_loss = float('inf')  # 记录历史最低 Loss
+    patience = 1000  # 耐心值：允许 Loss 多久不下降
+    patience_counter = 0  # 计数器
+    min_depth_iter = 3000  # 最小迭代次数 (防止还没开始就停了)
+
 
     for iteration in range(first_iter + 1, opt.iterations + 1):  # the real iteration (1 shift)
         iter_start.record()
@@ -426,44 +434,49 @@ def training(
                     # 3. 计算 Loss (只优化物体部分的法线)
                     loss_mono_normal = F.l1_loss(normal_map[:, valid_mask], mono_normal[:, valid_mask])
                     #loss += lambda_mono * loss_mono_normal
-                    # === 【新增 2】 动态早停与线性衰减策略 ===
 
-                    # 定义衰减区间 (相对于 pbr_iteration 的比例)
-                    # 0.0 ~ 0.5: 保持 100% 权重 (强力塑形)
-                    # 0.5 ~ 0.8: 线性衰减至 0% (慢慢放手)
-                    # 0.8 ~ 1.0: 权重为 0 (纯 RGB 修复细节)
-                    fade_start_ratio = 0.5
-                    fade_end_ratio = 0.8
+                    # === 【修改】 动态早停逻辑 (Loss Monitor) ===
+                    current_mono_val = loss_mono_normal.item() if isinstance(loss_mono_normal,
+                                                                             torch.Tensor) else loss_mono_normal
 
-                    current_ratio = iteration / float(pbr_iteration)
-                    current_lambda = 0.0
+                    if use_mono_depth and depth_sup_enabled and iteration > min_depth_iter:
+                        # 1. 计算 EMA (指数移动平均) 平滑 Loss，避免被瞬间的抖动误导
+                        # 0.9 是平滑系数，越接近 1 越平滑
+                        if mono_loss_ema is None:
+                            mono_loss_ema = current_mono_val
+                        else:
+                            mono_loss_ema = 0.9 * mono_loss_ema + 0.1 * current_mono_val
 
-                    if current_ratio < fade_start_ratio:
-                        # 第一阶段：全速运行
-                        current_lambda = lambda_mono
-                    elif current_ratio < fade_end_ratio:
-                        # 第二阶段：线性衰减 (Fade Out)
-                        # 计算进度 (0.0 -> 1.0)
-                        progress = (current_ratio - fade_start_ratio) / (fade_end_ratio - fade_start_ratio)
-                        current_lambda = lambda_mono * (1.0 - progress)
-                    else:
-                        # 第三阶段：彻底停止
-                        current_lambda = 0.0
+                        # 2. 检查是否改善 (设定一个微小的阈值 1e-5，防止数值波动)
+                        if mono_loss_ema < best_mono_loss - 1e-5:
+                            best_mono_loss = mono_loss_ema
+                            patience_counter = 0  # Loss 还在降，重置计数器，继续跑
+                        else:
+                            patience_counter += 1  # Loss 没降 (或升高了)，耐心 -1
 
-                        # 打印一次提示 (只在刚停止的那一瞬间打印)
-                        if not depth_sup_stopped and use_mono_depth:
-                            print(
-                                f"\n[INFO] Dynamic Early Stopping triggered at Iter {iteration} (Ratio {fade_end_ratio})")
-                            print(f"[INFO] Depth supervision is now OFF. Focusing on RGB refinement.")
-                            depth_sup_stopped = True
+                        # 3. 判断是否耗尽耐心 (触发早停)
+                        if patience_counter >= patience:
+                            print(f"\n\n[INFO] Auto-Stop Triggered at Iter {iteration}!")
+                            print(f"       Reason: Depth Loss stopped improving for {patience} steps.")
+                            print(f"       Best EMA: {best_mono_loss:.5f} | Current EMA: {mono_loss_ema:.5f}")
+                            print(f"       Action: Disabling depth supervision permanently.\n")
+                            depth_sup_enabled = False  # 永久关闭
 
-                    # 应用动态权重
-                    if current_lambda > 0:
-                        loss += current_lambda * loss_mono_normal
+                    # 4. 应用权重 (仅在开关开启时)
+                    if depth_sup_enabled:
+                        loss += lambda_mono * loss_mono_normal
 
-                    # 用于进度条显示 (更新这一行以便你在控制台看到实际生效的权重)
-                    loss_mono_normal_val = loss_mono_normal.item() if isinstance(loss_mono_normal,
-                                                                                 torch.Tensor) else loss_mono_normal
+                    # 5. 更新日志显示 (方便你观察)
+                    if iteration % 10 == 0 and use_mono_depth:
+                        status_str = f"{current_mono_val:.4f}"
+                        if not depth_sup_enabled:
+                            status_str += " (OFF)"
+                        elif mono_loss_ema is not None:
+                            # 显示 EMA 和 耐心消耗情况，例如: 0.0521 (P:150/1000)
+                            status_str += f" (P:{patience_counter})"
+
+                        loss_log["New_D"] = status_str
+                    # ==============================================
 
             # # >>>>> 结束新增 <<<<<
 
