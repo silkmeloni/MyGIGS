@@ -288,6 +288,8 @@ def training(
     progress_bar = trange(first_iter, opt.iterations, desc="Training progress")  # For logging
     use_mono_depth = getattr(dataset, "use_mono_depth", False)
 
+    # === 【新增 1】 初始化早停标志位 ===
+    depth_sup_stopped = False  # 用来记录是否已经打印过停止信息
 
     for iteration in range(first_iter + 1, opt.iterations + 1):  # the real iteration (1 shift)
         iter_start.record()
@@ -372,15 +374,15 @@ def training(
         lambda_mono = getattr(opt, "lambda_mono", 0.1)
 
 
-        if iteration <= 3000: #第一阶段：纯几何，让物体长出轮廓
-            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
-            normal_loss_weight = 1.0
-            mask = rendering_result["normal_from_depth_mask"]
-            normal_loss = F.l1_loss(normal_map[:, mask], normal_map_from_depth[:, mask])
-            loss += normal_loss_weight * normal_loss
-            normal_tv_loss = get_tv_loss(gt_image, normal_map, pad=1, step=1)
-            loss += normal_tv_loss * normal_tv_weight
-        elif iteration <= pbr_iteration:
+        # if iteration <= 3000: #第一阶段：纯几何，让物体长出轮廓
+        #     loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+        #     normal_loss_weight = 1.0
+        #     mask = rendering_result["normal_from_depth_mask"]
+        #     normal_loss = F.l1_loss(normal_map[:, mask], normal_map_from_depth[:, mask])
+        #     loss += normal_loss_weight * normal_loss
+        #     normal_tv_loss = get_tv_loss(gt_image, normal_map, pad=1, step=1)
+        #     loss += normal_tv_loss * normal_tv_weight
+        if iteration <= pbr_iteration:
             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
             # >>>>> 新增: Depth Anything 法线监督 <<<<<
             mask = rendering_result["normal_from_depth_mask"]
@@ -423,7 +425,45 @@ def training(
                     mono_normal = mono_normal.detach()
                     # 3. 计算 Loss (只优化物体部分的法线)
                     loss_mono_normal = F.l1_loss(normal_map[:, valid_mask], mono_normal[:, valid_mask])
-                    loss += lambda_mono * loss_mono_normal
+                    #loss += lambda_mono * loss_mono_normal
+                    # === 【新增 2】 动态早停与线性衰减策略 ===
+
+                    # 定义衰减区间 (相对于 pbr_iteration 的比例)
+                    # 0.0 ~ 0.5: 保持 100% 权重 (强力塑形)
+                    # 0.5 ~ 0.8: 线性衰减至 0% (慢慢放手)
+                    # 0.8 ~ 1.0: 权重为 0 (纯 RGB 修复细节)
+                    fade_start_ratio = 0.5
+                    fade_end_ratio = 0.8
+
+                    current_ratio = iteration / float(pbr_iteration)
+                    current_lambda = 0.0
+
+                    if current_ratio < fade_start_ratio:
+                        # 第一阶段：全速运行
+                        current_lambda = lambda_mono
+                    elif current_ratio < fade_end_ratio:
+                        # 第二阶段：线性衰减 (Fade Out)
+                        # 计算进度 (0.0 -> 1.0)
+                        progress = (current_ratio - fade_start_ratio) / (fade_end_ratio - fade_start_ratio)
+                        current_lambda = lambda_mono * (1.0 - progress)
+                    else:
+                        # 第三阶段：彻底停止
+                        current_lambda = 0.0
+
+                        # 打印一次提示 (只在刚停止的那一瞬间打印)
+                        if not depth_sup_stopped and use_mono_depth:
+                            print(
+                                f"\n[INFO] Dynamic Early Stopping triggered at Iter {iteration} (Ratio {fade_end_ratio})")
+                            print(f"[INFO] Depth supervision is now OFF. Focusing on RGB refinement.")
+                            depth_sup_stopped = True
+
+                    # 应用动态权重
+                    if current_lambda > 0:
+                        loss += current_lambda * loss_mono_normal
+
+                    # 用于进度条显示 (更新这一行以便你在控制台看到实际生效的权重)
+                    loss_mono_normal_val = loss_mono_normal.item() if isinstance(loss_mono_normal,
+                                                                                 torch.Tensor) else loss_mono_normal
 
             # # >>>>> 结束新增 <<<<<
 
