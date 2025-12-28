@@ -466,16 +466,16 @@ def training(
                     if depth_sup_enabled:
                         loss += lambda_mono * loss_mono_normal
 
-                    # 5. 更新日志显示 (方便你观察)
-                    if iteration % 10 == 0 and use_mono_depth:
-                        status_str = f"{current_mono_val:.4f}"
-                        if not depth_sup_enabled:
-                            status_str += " (OFF)"
-                        elif mono_loss_ema is not None:
-                            # 显示 EMA 和 耐心消耗情况，例如: 0.0521 (P:150/1000)
-                            status_str += f" (P:{patience_counter})"
-
-                        loss_log["New_D"] = status_str
+                    # # 5. 更新日志显示 (方便你观察)
+                    # if iteration % 10 == 0 and use_mono_depth:
+                    #     status_str = f"{current_mono_val:.4f}"
+                    #     if not depth_sup_enabled:
+                    #         status_str += " (OFF)"
+                    #     elif mono_loss_ema is not None:
+                    #         # 显示 EMA 和 耐心消耗情况，例如: 0.0521 (P:150/1000)
+                    #         status_str += f" (P:{patience_counter})"
+                    #
+                    #     loss_log["New_D"] = status_str
                     # ==============================================
 
             # # >>>>> 结束新增 <<<<<
