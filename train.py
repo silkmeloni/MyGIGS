@@ -397,7 +397,7 @@ def training(
 
             # === 修改 1: 如果开启深度先验，禁用或降低原始几何约束 ===
             if use_mono_depth:
-                normal_loss_weight = 0.0  # 或者 0.01，保留一点点约束
+                normal_loss_weight = 0.2  # 或者 0.01，保留一点点约束
             else:
                 normal_loss_weight = 1.0
                 normal_loss = F.l1_loss(normal_map[:, mask], normal_map_from_depth[:, mask])
