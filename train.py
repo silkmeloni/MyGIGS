@@ -241,6 +241,8 @@ def training(
     step: int = 16,
     start: int = 8,
     indirect: bool = False,
+# 【新增】接收位置约束参数
+    use_position_opt: bool = False,
 ) -> None:
     first_iter = 0
     gaussians = GaussianModel(dataset.sh_degree)
@@ -400,10 +402,11 @@ def training(
                 normal_loss_weight = 0.2  # 或者 0.01，保留一点点约束
             else:
                 normal_loss_weight = 1.0
-                normal_loss = F.l1_loss(normal_map[:, mask], normal_map_from_depth[:, mask])
-                loss += normal_loss_weight * normal_loss
-                normal_tv_loss = get_tv_loss(gt_image, normal_map, pad=1, step=1)
-                loss += normal_tv_loss * normal_tv_weight
+
+            normal_loss = F.l1_loss(normal_map[:, mask], normal_map_from_depth[:, mask])
+            loss += normal_loss_weight * normal_loss
+            normal_tv_loss = get_tv_loss(gt_image, normal_map, pad=1, step=1)
+            loss += normal_tv_loss * normal_tv_weight
 
             # rendering_result["normal_map"] 是高斯显式优化的法线
             # rendering_result["normal_map_from_depth"] 是渲染深度算出来的几何法线
@@ -413,27 +416,26 @@ def training(
                 render_depth = rendering_result["depth_map"]  # 确保渲染器返回了 depth_map
 
                 # === 【核心修改】引入 GT Alpha Mask ===
-                # 获取数据集自带的 Alpha Mask (1, H, W) -> (H, W)
-                # 放到 GPU 并二值化 (阈值 0.5)
                 gt_alpha_mask = (viewpoint_cam.gt_alpha_mask.cuda().squeeze() > 0.5)
-
-                # 更新 valid_mask 的逻辑：
-                # 1. mono_depth > 0: 单目深度图有值
-                # 2. mask.squeeze(): 当前渲染出的几何法线有效 (原有逻辑)
-                # 3. gt_alpha_mask: 只在真值掩膜范围内计算 (剔除背景!)
                 valid_mask = (mono_depth > 0) & mask.squeeze() & gt_alpha_mask
-                # ====================================
 
                 # 加上数量判断，防止 mask 全黑导致报错
                 if valid_mask.sum() > 10:
                     # 1. 深度对齐 (现在的 Scale/Shift 只会由物体区域决定，非常准确) 必须有detach，防止反过来去改单目深度
                     aligned_mono_depth = align_depth_robust(mono_depth, render_depth.squeeze().detach(), valid_mask)
-                    # 2. 转法线 # 双重保险：确保作为 Target 的法线也是 detach 的
+
+                    # === 【核心修改】 方面一：位置约束 ===
+                    # 只有当参数开启时，才把 Depth Loss 加入总 Loss
+                    if use_position_opt:
+                        diff_depth = torch.abs(render_depth.squeeze()[valid_mask] - aligned_mono_depth[valid_mask])# 使用 Log Loss 替代 L1，更鲁棒
+                        loss_depth_pos = torch.log(1.0 + diff_depth).mean()
+                        loss += lambda_mono * loss_depth_pos
+
+                    # === 【核心修改】 方面二：法线约束 ===
                     mono_normal = render_normal(viewpoint_cam, aligned_mono_depth)
                     mono_normal = mono_normal.detach()
                     # 3. 计算 Loss (只优化物体部分的法线)
                     loss_mono_normal = F.l1_loss(normal_map[:, valid_mask], mono_normal[:, valid_mask])
-                    #loss += lambda_mono * loss_mono_normal
 
                     # === 【修改】 动态早停逻辑 (Loss Monitor) ===
                     current_mono_val = loss_mono_normal.item() if isinstance(loss_mono_normal,
@@ -465,18 +467,6 @@ def training(
                     # 4. 应用权重 (仅在开关开启时)
                     if depth_sup_enabled:
                         loss += lambda_mono * loss_mono_normal
-
-                    # # 5. 更新日志显示 (方便你观察)
-                    # if iteration % 10 == 0 and use_mono_depth:
-                    #     status_str = f"{current_mono_val:.4f}"
-                    #     if not depth_sup_enabled:
-                    #         status_str += " (OFF)"
-                    #     elif mono_loss_ema is not None:
-                    #         # 显示 EMA 和 耐心消耗情况，例如: 0.0521 (P:150/1000)
-                    #         status_str += f" (P:{patience_counter})"
-                    #
-                    #     loss_log["New_D"] = status_str
-                    # ==============================================
 
             # # >>>>> 结束新增 <<<<<
 
@@ -1129,10 +1119,15 @@ if __name__ == "__main__":
     parser.add_argument("--indirect", action="store_true", help="Enable indirect diffuse modeling.")
     #ljx:单目深度 损失函数权重参数
     parser.add_argument("--lambda_mono", default=0.0, type=float, help="Weight for mono-depth normal supervision")
+    # 【新增】位置约束开关
+    parser.add_argument("--use_position_opt", action="store_true",
+                        help="If True, optimize Gaussian positions using Depth L1/Log loss.")
+
     args = parser.parse_args(sys.argv[1:])
     args.test_iterations.append(args.iterations)
     args.save_iterations.append(args.iterations)
     args.checkpoint_iterations.append(args.iterations)
+
 
     print("Optimizing " + args.model_path)
 
@@ -1168,6 +1163,8 @@ if __name__ == "__main__":
         step=args.step,
         start=args.start,
         indirect=args.indirect,
+        # 【新增】接收位置约束参数
+        use_position_opt=args.use_position_opt,
     )
 
     # All done
