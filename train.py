@@ -28,6 +28,8 @@ from utils.image_utils import psnr, turbo_cmap, erode
 from utils.loss_utils import l1_loss, ssim, get_img_grad_weight
 from utils.graphics_utils import normal_from_depth_image
 
+import torchvision
+
 try:
     from torch.utils.tensorboard import SummaryWriter
 
@@ -384,89 +386,146 @@ def training(
         lambda_mono = getattr(opt, "lambda_mono", 0.1)
 
 
-        # if iteration <= 3000: #第一阶段：纯几何，让物体长出轮廓
-        #     loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
-        #     normal_loss_weight = 1.0
-        #     mask = rendering_result["normal_from_depth_mask"]
-        #     normal_loss = F.l1_loss(normal_map[:, mask], normal_map_from_depth[:, mask])
-        #     loss += normal_loss_weight * normal_loss
-        #     normal_tv_loss = get_tv_loss(gt_image, normal_map, pad=1, step=1)
-        #     loss += normal_tv_loss * normal_tv_weight
+
+
         if iteration <= pbr_iteration:
-            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
-            # >>>>> 新增: Depth Anything 法线监督 <<<<<
+
             mask = rendering_result["normal_from_depth_mask"]
-
-            # === 修改 1: 如果开启深度先验，禁用或降低原始几何约束 ===
-            if use_mono_depth:
-                normal_loss_weight = 0.2  # 或者 0.01，保留一点点约束
-            else:
-                normal_loss_weight = 1.0
-
+            # 原有的rgb_loss
+            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+            # === 原有的normal_loss保持不变 ===
+            normal_loss_weight = 1.0
             normal_loss = F.l1_loss(normal_map[:, mask], normal_map_from_depth[:, mask])
             loss += normal_loss_weight * normal_loss
             normal_tv_loss = get_tv_loss(gt_image, normal_map, pad=1, step=1)
             loss += normal_tv_loss * normal_tv_weight
 
-            # rendering_result["normal_map"] 是高斯显式优化的法线
-            # rendering_result["normal_map_from_depth"] 是渲染深度算出来的几何法线
+            # >>>>> 新增/修改: Depth Anything 深度与法线监督 <<<<<
 
-            if use_mono_depth and hasattr(viewpoint_cam,'mono_depth_image') and viewpoint_cam.mono_depth_image is not None:
-                mono_depth = viewpoint_cam.mono_depth_image
-                render_depth = rendering_result["depth_map"]  # 确保渲染器返回了 depth_map
+            # 1. 设置预热步数 (Warm-up)，前 1000 步不加约束，防止 Scale 计算错误
+            loss_mono_depth_val = 0.0  # 用于日志
+            if use_mono_depth and iteration > 1000:
+                if hasattr(viewpoint_cam, 'mono_depth_image') and viewpoint_cam.mono_depth_image is not None:
+                    mono_depth = viewpoint_cam.mono_depth_image
+                    render_depth = rendering_result["depth_map"]
 
-                # === 【核心修改】引入 GT Alpha Mask ===
-                gt_alpha_mask = (viewpoint_cam.gt_alpha_mask.cuda().squeeze() > 0.5)
-                valid_mask = (mono_depth > 0) & mask.squeeze() & gt_alpha_mask
+                    # GT Alpha Mask 筛选
+                    gt_alpha_mask = (viewpoint_cam.gt_alpha_mask.cuda().squeeze() > 0.5)
+                    # 过滤掉极小深度值
+                    valid_mask = (mono_depth > 1e-4) & mask.squeeze() & gt_alpha_mask
 
-                # 加上数量判断，防止 mask 全黑导致报错
-                if valid_mask.sum() > 10:
-                    # 1. 深度对齐 (现在的 Scale/Shift 只会由物体区域决定，非常准确) 必须有detach，防止反过来去改单目深度
-                    aligned_mono_depth = align_depth_robust(mono_depth, render_depth.squeeze().detach(), valid_mask)
+                    if valid_mask.sum() > 100:  # 稍微提高阈值
+                        #=== 修改1: 原始几何约束权重策略 ===
+                        # 对齐深度 (Detach render_depth 防止梯度回传给 Scale 计算)
+                        aligned_mono_depth = align_depth_robust(mono_depth, render_depth.squeeze().detach(), valid_mask)
 
-                    # === 【核心修改】 方面一：位置约束 ===
-                    # 只有当参数开启时，才把 Depth Loss 加入总 Loss
-                    if use_position_opt:
-                        diff_depth = torch.abs(render_depth.squeeze()[valid_mask] - aligned_mono_depth[valid_mask])# 使用 Log Loss 替代 L1，更鲁棒
+                        # === 关键修改 2: 对单目深度进行平滑 (去噪) ===
+                        # 使用 kornia 的高斯模糊，kernel size 可以大一点 (e.g., 9x9 或 15x15)
+                        # sigma 设为 1.0 - 2.0
+                        aligned_mono_depth_smooth = kornia.filters.gaussian_blur2d(
+                            aligned_mono_depth[None, None, ...],
+                            kernel_size=(9, 9),
+                            sigma=(1.5, 1.5)
+                        ).squeeze()
+
+                        # === 关键修改 3: 优先使用深度 Loss (位置约束) ===
+                        # 这是解决几何问题的核心。即使 args.use_position_opt 没开，建议也在这里强制使用或检查
+                        # 使用 Log L1 Loss 对异常值更鲁棒
+                        diff_depth = torch.abs(render_depth.squeeze()[valid_mask] - aligned_mono_depth[valid_mask])
                         loss_depth_pos = torch.log(1.0 + diff_depth).mean()
+
+                        # 给深度 Loss 一个较大的权重 (例如 lambda_mono)
                         loss += lambda_mono * loss_depth_pos
+                        loss_mono_depth_val = loss_depth_pos.item()  # 记录给日志
 
-                    # === 【核心修改】 方面二：法线约束 ===
-                    mono_normal = render_normal(viewpoint_cam, aligned_mono_depth)
-                    mono_normal = mono_normal.detach()
-                    # 3. 计算 Loss (只优化物体部分的法线)
-                    loss_mono_normal = F.l1_loss(normal_map[:, valid_mask], mono_normal[:, valid_mask])
+                        # === 关键修改 4: 法线约束 (慎用或降权) ===
+                        # 如果非要加法线约束，请使用“平滑后”的深度来计算法线
+                        # 并且权重建议给得非常小 (e.g., 0.01 * lambda_mono)
+                        # 因为 render_normal 主要是为了平滑，而 normal_tv 已经有这个作用了
 
-                    # === 【修改】 动态早停逻辑 (Loss Monitor) ===
-                    current_mono_val = loss_mono_normal.item() if isinstance(loss_mono_normal,
-                                                                             torch.Tensor) else loss_mono_normal
+                        # 计算平滑后的单目法线
+                        mono_normal_smooth = render_normal(viewpoint_cam, aligned_mono_depth_smooth, scale=1).detach()
 
-                    if use_mono_depth and depth_sup_enabled and iteration > min_depth_iter:
-                        # 1. 计算 EMA (指数移动平均) 平滑 Loss，避免被瞬间的抖动误导
-                        # 0.9 是平滑系数，越接近 1 越平滑
-                        if mono_loss_ema is None:
-                            mono_loss_ema = current_mono_val
-                        else:
-                            mono_loss_ema = 0.9 * mono_loss_ema + 0.1 * current_mono_val
+                        # 计算法线 Loss (Cos 距离通常比 L1 对法线更友好，或者继续用 L1)
+                        # 注意：这里监督的是 normal_map (属性)，也可以尝试监督 normal_map_from_depth (几何)
+                        loss_mono_normal = F.l1_loss(normal_map[:, valid_mask], mono_normal_smooth[:, valid_mask])
 
-                        # 2. 检查是否改善 (设定一个微小的阈值 1e-5，防止数值波动)
-                        if mono_loss_ema < best_mono_loss - 1e-5:
-                            best_mono_loss = mono_loss_ema
-                            patience_counter = 0  # Loss 还在降，重置计数器，继续跑
-                        else:
-                            patience_counter += 1  # Loss 没降 (或升高了)，耐心 -1
+                        # 给法线 Loss 一个很小的权重，避免它破坏高频纹理
+                        # 如果发现纹理还是糊，把这个 0.1 改成 0.0 或更小
+                        loss += (lambda_mono * 0.1) * loss_mono_normal
 
-                        # 3. 判断是否耗尽耐心 (触发早停)
-                        if patience_counter >= patience:
-                            print(f"\n\n[INFO] Auto-Stop Triggered at Iter {iteration}!")
-                            print(f"       Reason: Depth Loss stopped improving for {patience} steps.")
-                            print(f"       Best EMA: {best_mono_loss:.5f} | Current EMA: {mono_loss_ema:.5f}")
-                            print(f"       Action: Disabling depth supervision permanently.\n")
-                            depth_sup_enabled = False  # 永久关闭
+                        # ==================== [修正后的 DEBUG 代码] ====================
+                        if iteration % 100 == 0:
+                            debug_dir = os.path.join(args.model_path, "debug_normals")
+                            os.makedirs(debug_dir, exist_ok=True)
 
-                    # 4. 应用权重 (仅在开关开启时)
-                    if depth_sup_enabled:
-                        loss += lambda_mono * loss_mono_normal
+                            # 1. 获取预测法线
+                            pred_vis = rendering_result["normal_map"].detach()
+
+                            # 2. 获取单目深度 (优先取平滑后的，没有则取原始的)
+                            if 'aligned_mono_depth_smooth' in locals():
+                                target_depth = locals()['aligned_mono_depth_smooth']
+                            elif 'aligned_mono_depth' in locals():
+                                target_depth = locals()['aligned_mono_depth']
+                            elif hasattr(viewpoint_cam, 'mono_depth_image'):
+                                target_depth = viewpoint_cam.mono_depth_image
+                            else:
+                                target_depth = None
+
+                            if target_depth is not None:
+                                # ---------------------------------------------------------
+                                # 手动构建内参矩阵 (Intrinsic)，避免调用不存在的属性
+                                # ---------------------------------------------------------
+                                # 3DGS 使用的视场角转焦距公式
+                                focal_x = viewpoint_cam.image_width / (2.0 * math.tan(viewpoint_cam.FoVx / 2.0))
+                                focal_y = viewpoint_cam.image_height / (2.0 * math.tan(viewpoint_cam.FoVy / 2.0))
+
+                                # 构建 3x3 内参矩阵
+                                intrinsic_matrix = torch.tensor([
+                                    [focal_x, 0, viewpoint_cam.image_width / 2.0],
+                                    [0, focal_y, viewpoint_cam.image_height / 2.0],
+                                    [0, 0, 1]
+                                ], device="cuda", dtype=torch.float32)
+
+                                # 获取外参 (World-to-View)，Camera 类中存的是转置过的，所以要转回来
+                                extrinsic_matrix = viewpoint_cam.world_view_transform.transpose(0, 1)
+
+                                # ---------------------------------------------------------
+                                # 调用 utils.graphics_utils 计算单目法线
+                                # ---------------------------------------------------------
+                                from utils.graphics_utils import normal_from_depth_image
+
+                                # 确保深度图维度匹配 (H, W)
+                                if len(target_depth.shape) == 3:
+                                    target_depth = target_depth.squeeze()
+
+                                # 计算 Target 法线 (利用修复后的 depth2point_world 转回世界坐标)
+                                target_vis = normal_from_depth_image(
+                                    target_depth,
+                                    intrinsic_matrix,
+                                    extrinsic_matrix
+                                ).detach()
+
+                                # 调整维度从 [H, W, 3] 到 [3, H, W]
+                                if target_vis.shape[-1] == 3:
+                                    target_vis = target_vis.permute(2, 0, 1)
+
+                                # 3. 归一化颜色用于可视化
+                                pred_img = (pred_vis + 1.0) * 0.5
+                                target_img = (target_vis + 1.0) * 0.5
+
+                                # 4. 尺寸对齐并拼接
+                                if pred_img.shape[1:] != target_img.shape[1:]:
+                                    target_img = torch.nn.functional.interpolate(target_img.unsqueeze(0),
+                                                                                 size=pred_img.shape[1:],
+                                                                                 mode='bilinear').squeeze(0)
+
+                                comparison = torch.cat([pred_img, target_img], dim=2)
+
+                                # 5. 保存
+                                torchvision.utils.save_image(comparison, f"{debug_dir}/step_{iteration:05d}_debug.png")
+                                print(f"[DEBUG] Saved normal check to {debug_dir}/step_{iteration:05d}_debug.png")
+                        # ==================== [DEBUG 代码结束] ====================
 
             # # >>>>> 结束新增 <<<<<
 
