@@ -85,7 +85,40 @@ def align_depth_robust(mono_depth, render_depth, mask):
     aligned_disp = torch.clamp(aligned_disp, min=eps)
     aligned_mono_depth = 1.0 / aligned_disp
 
-    return aligned_mono_depth
+    return aligned_mono_depth,scale,offset
+
+
+def pearson_correlation_loss(pred, target, mask=None):
+    """
+    计算皮尔逊相关系数 Loss。
+    Loss = 1 - Correlation
+    范围 [0, 2]，0 表示完全正相关（形状一致），1 表示无关，2 表示负相关。
+    """
+    if mask is not None:
+        pred = pred[mask]
+        target = target[mask]
+
+    # 避免空数据或数据太少
+    if pred.numel() < 10:
+        return torch.tensor(0.0, device=pred.device, requires_grad=True)
+
+    # 1. 减去均值 (Center the data) -> 消除 Shift 影响
+    pred_mean = pred.mean()
+    target_mean = target.mean()
+    pred_centered = pred - pred_mean
+    target_centered = target - target_mean
+
+    # 2. 计算标准差 (Std) -> 消除 Scale 影响
+    # 加上 1e-8 防止除以零
+    pred_std = torch.sqrt((pred_centered ** 2).sum() + 1e-8)
+    target_std = torch.sqrt((target_centered ** 2).sum() + 1e-8)
+
+    # 3. 计算相关系数
+    correlation = (pred_centered * target_centered).sum() / (pred_std * target_std + 1e-8)
+
+    # 4. 返回 Loss (我们要最大化相关性，即最小化 1 - r)
+    return 1.0 - correlation
+
 
 def render_normal(viewpoint_cam, depth, offset=None, normal=None, scale=1):
     # depth: (H, W), bg_color: (3), alpha: (H, W)
@@ -386,8 +419,6 @@ def training(
         lambda_mono = getattr(opt, "lambda_mono", 0.1)
 
 
-
-
         if iteration <= pbr_iteration:
 
             mask = rendering_result["normal_from_depth_mask"]
@@ -417,7 +448,7 @@ def training(
                     if valid_mask.sum() > 100:  # 稍微提高阈值
                         #=== 修改1: 原始几何约束权重策略 ===
                         # 对齐深度 (Detach render_depth 防止梯度回传给 Scale 计算)
-                        aligned_mono_depth = align_depth_robust(mono_depth, render_depth.squeeze().detach(), valid_mask)
+                        aligned_mono_depth,scale,offset = align_depth_robust(mono_depth, render_depth.squeeze().detach(), valid_mask)
 
                         # === 关键修改 2: 对单目深度进行平滑 (去噪) ===
                         # 使用 kornia 的高斯模糊，kernel size 可以大一点 (e.g., 9x9 或 15x15)
