@@ -111,14 +111,40 @@ def depth2point_cam(sampled_depth, ref_intrinsic):
     cam_xyz = ndc_2_cam(ndc_xyz, ref_intrinsic, W, H) # 1, 1, 5, 512, 640, 3
     return ndc_xyz, cam_xyz
 
+# def depth2point_world(depth_image, intrinsic_matrix, extrinsic_matrix):
+#     # depth_image: (H, W), intrinsic_matrix: (3, 3), extrinsic_matrix: (4, 4)
+#     _, xyz_cam = depth2point_cam(depth_image[None,None,None,...], intrinsic_matrix[None,...])
+#     xyz_cam = xyz_cam.reshape(-1,3)
+#     # xyz_world = torch.cat([xyz_cam, torch.ones_like(xyz_cam[...,0:1])], axis=-1) @ torch.inverse(extrinsic_matrix).transpose(0,1)
+#     # xyz_world = xyz_world[...,:3]
+#
+#     return xyz_cam
+# 修改 utils/graphics_utils.py
+
 def depth2point_world(depth_image, intrinsic_matrix, extrinsic_matrix):
     # depth_image: (H, W), intrinsic_matrix: (3, 3), extrinsic_matrix: (4, 4)
-    _, xyz_cam = depth2point_cam(depth_image[None,None,None,...], intrinsic_matrix[None,...])
-    xyz_cam = xyz_cam.reshape(-1,3)
-    # xyz_world = torch.cat([xyz_cam, torch.ones_like(xyz_cam[...,0:1])], axis=-1) @ torch.inverse(extrinsic_matrix).transpose(0,1)
-    # xyz_world = xyz_world[...,:3]
+    _, xyz_cam = depth2point_cam(depth_image[None, None, None, ...], intrinsic_matrix[None, ...])
+    xyz_cam = xyz_cam.reshape(-1, 3)
 
-    return xyz_cam
+    # >>> 取消注释以下代码 <<<
+    # 以此处为准，确保extrinsic_matrix是World2View矩阵（通常Colmap/3DGS loader提供的是W2V）
+    # 我们需要View2World，即inverse(extrinsic_matrix)
+
+    # 构造齐次坐标 (N, 4)
+    ones = torch.ones_like(xyz_cam[..., 0:1])
+    xyz_cam_hom = torch.cat([xyz_cam, ones], dim=-1)
+
+    # 计算 View -> World 变换
+    # 注意：如果 extrinsic_matrix 是 [R|t] (W2V)，则需要求逆
+    view2world = torch.inverse(extrinsic_matrix)
+
+    # 矩阵乘法: (N, 4) @ (4, 4)^T
+    xyz_world = xyz_cam_hom @ view2world.transpose(0, 1)
+
+    xyz_world = xyz_world[..., :3]
+
+    return xyz_world
+
 
 def depth_pcd2normal(xyz, offset=None, gt_image=None):
     hd, wd, _ = xyz.shape 

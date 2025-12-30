@@ -2,3 +2,4 @@
 scene/__pycache__
 arguments/__pycache__
 utils/__pycache__
+pbr/renderutils/__pycache__
