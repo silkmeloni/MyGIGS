@@ -45,6 +45,9 @@ class CameraInfo(NamedTuple):
     width: int
     height: int
     depth_mono_path: str #ljx，da2的单目深度路径
+    # [新增]
+    depth_scale: float = 1.0
+    depth_shift: float = 0.0
 
 
 class SceneInfo(NamedTuple):

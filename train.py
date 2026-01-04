@@ -415,6 +415,7 @@ def training(
         loss: torch.Tensor
         Ll1 = F.l1_loss(image, gt_image)
         normal_loss = 0.0
+        loss_depth_pos = 0.0
         loss_mono_normal = 0.0
         lambda_mono = getattr(opt, "lambda_mono", 0.1)
 
@@ -469,21 +470,21 @@ def training(
                         loss += lambda_mono * loss_depth_pos
                         loss_mono_depth_val = loss_depth_pos.item()  # 记录给日志
 
-                        # === 关键修改 4: 法线约束 (慎用或降权) ===
-                        # 如果非要加法线约束，请使用“平滑后”的深度来计算法线
-                        # 并且权重建议给得非常小 (e.g., 0.01 * lambda_mono)
-                        # 因为 render_normal 主要是为了平滑，而 normal_tv 已经有这个作用了
-
-                        # 计算平滑后的单目法线
-                        mono_normal_smooth = render_normal(viewpoint_cam, aligned_mono_depth_smooth, scale=1).detach()
-
-                        # 计算法线 Loss (Cos 距离通常比 L1 对法线更友好，或者继续用 L1)
-                        # 注意：这里监督的是 normal_map (属性)，也可以尝试监督 normal_map_from_depth (几何)
-                        loss_mono_normal = F.l1_loss(normal_map[:, valid_mask], mono_normal_smooth[:, valid_mask])
-
-                        # 给法线 Loss 一个很小的权重，避免它破坏高频纹理
-                        # 如果发现纹理还是糊，把这个 0.1 改成 0.0 或更小
-                        loss += (lambda_mono * 0.1) * loss_mono_normal
+                        # # === 关键修改 4: 法线约束 (慎用或降权) ===
+                        # # 如果非要加法线约束，请使用“平滑后”的深度来计算法线
+                        # # 并且权重建议给得非常小 (e.g., 0.01 * lambda_mono)
+                        # # 因为 render_normal 主要是为了平滑，而 normal_tv 已经有这个作用了
+                        #
+                        # # 计算平滑后的单目法线
+                        # mono_normal_smooth = render_normal(viewpoint_cam, aligned_mono_depth_smooth, scale=1).detach()
+                        #
+                        # # 计算法线 Loss (Cos 距离通常比 L1 对法线更友好，或者继续用 L1)
+                        # # 注意：这里监督的是 normal_map (属性)，也可以尝试监督 normal_map_from_depth (几何)
+                        # loss_mono_normal = F.l1_loss(normal_map[:, valid_mask], mono_normal_smooth[:, valid_mask])
+                        #
+                        # # 给法线 Loss 一个很小的权重，避免它破坏高频纹理
+                        # # 如果发现纹理还是糊，把这个 0.1 改成 0.0 或更小
+                        # loss += (lambda_mono * 0.1) * loss_mono_normal
 
                         # ==================== [修正后的 DEBUG 代码] ====================
                         if iteration % 100 == 0:
@@ -666,10 +667,16 @@ def training(
                 else:
                     normal_loss_val = normal_loss
 
-                if isinstance(loss_mono_normal, torch.Tensor):
-                    loss_mono_normal_val = loss_mono_normal.item()
+                if isinstance(loss_depth_pos, torch.Tensor):
+                    loss_mono_depth_val = loss_depth_pos.item()
                 else:
-                    loss_mono_normal_val = loss_mono_normal
+                    loss_mono_depth_val = loss_depth_pos
+
+                # if isinstance(loss_mono_normal, torch.Tensor):
+                #     loss_mono_normal_val = loss_mono_normal.item()
+                # else:
+                #     loss_mono_normal_val = loss_mono_normal
+
 
                 loss_log = {
                     "Loss": f"{loss.item():.{5}f}",
@@ -678,20 +685,22 @@ def training(
 
                 # 2. 如果开启深度先验，往字典里加一项
                 if use_mono_depth:
-                    loss_log["New_D"] = f"{loss_mono_normal_val:.{5}f}"
+                    loss_log["New_D"] = f"{loss_mono_depth_val:.{5}f}"
+                    # loss_log["New_N"] = f"{loss_mono_normal_val:.{5}f}"
 
                 # 3. 更新进度条 (注意这里的缩进，必须在 if use_mono_depth 外面)
                 progress_bar.set_postfix(loss_log)
                 progress_bar.update(10)
 
+                #额外打印，用于回看
                 if iteration % 500 == 0:
-                    # 使用 \n 换行，确保这行字会被保留在控制台历史里，方便你训练完回看
                     # 格式：[Iter 1500] Loss: 0.12345 | Org_N: 0.05000 | New_D: 0.02000
                     print(
                         f"\n[Iter {iteration:05d}] "
                         f"Loss: {loss.item():.5f} | "
                         f"Org_N: {normal_loss_val:.5f} | "
-                        f"New_D: {loss_mono_normal_val:.5f}"
+                        f"New_D: {loss_mono_depth_val:.5f}"
+                        #f"New_N: {loss_mono_normal_val:.5f}"
                     )
 
                 # # === 【新增】记录 Loss 曲线到 TensorBoard ===
