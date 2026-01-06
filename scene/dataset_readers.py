@@ -20,6 +20,7 @@ from PIL import Image
 from plyfile import PlyData, PlyElement
 import cv2  # [新增] 用于读取深度图计算 scale
 import struct
+from joblib import Parallel, delayed
 
 from scene.colmap_loader import (
     qvec2rotmat,
