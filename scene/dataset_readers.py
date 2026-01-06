@@ -18,6 +18,7 @@ from typing import Dict, List, NamedTuple, Optional, Tuple
 import numpy as np
 from PIL import Image
 from plyfile import PlyData, PlyElement
+import cv2  # [新增] 用于读取深度图计算 scale
 
 from scene.colmap_loader import (
     qvec2rotmat,
@@ -82,6 +83,162 @@ def getNerfppNorm(cam_info: List[CameraInfo]) -> Dict:
     return {"translate": translate, "radius": radius}
 
 
+# [新增] 读取 points3D 到字典的辅助函数 (Binary)
+def read_points3D_binary_dict(path):
+    points3D = {}
+    with open(path, "rb") as fid:
+        num_points = struct.unpack("Q", fid.read(8))[0]
+        for _ in range(num_points):
+            binary_point_line_properties = fid.read(43)
+            point3D_id = struct.unpack("Q", binary_point_line_properties[0:8])[0]
+            xyz = struct.unpack("3d", binary_point_line_properties[8:32])
+            rgb = struct.unpack("3B", binary_point_line_properties[32:35])
+            error = struct.unpack("d", binary_point_line_properties[35:43])[0]
+            track_length = struct.unpack("Q", fid.read(8))[0]
+            track_elems = fid.read(8 * track_length)
+            points3D[point3D_id] = np.array(xyz)
+    return points3D
+
+
+# [新增] 读取 points3D 到字典的辅助函数 (Text)
+def read_points3D_text_dict(path):
+    points3D = {}
+    with open(path, "r") as fid:
+        while True:
+            line = fid.readline()
+            if not line:
+                break
+            line = line.strip()
+            if len(line) > 0 and line[0] != "#":
+                elems = line.split()
+                point3D_id = int(elems[0])
+                xyz = np.array(tuple(map(float, elems[1:4])))
+                points3D[point3D_id] = xyz
+                # Skip the next line (track information)
+                fid.readline()
+    return points3D
+
+
+# [新增] 单张图片计算 Scale 和 Offset 的逻辑
+def compute_depth_scale(key, cam_extrinsics, cam_intrinsics, points3d_dict, depths_dir):
+    image_meta = cam_extrinsics[key]
+    cam_intrinsic = cam_intrinsics[image_meta.camera_id]
+
+    # 获取 2D 点和对应的 3D 点 ID
+    pts_idx = image_meta.point3D_ids
+    valid_xys = image_meta.xys
+
+    # 筛选有效的 3D 点 (ID != -1 且在 points3d_dict 中存在)
+    valid_mask = (pts_idx != -1)
+    # 进一步检查 ID 是否真正在 dict 中 (防止 colmap 数据不一致)
+    final_mask = []
+    for i, pid in enumerate(pts_idx):
+        if valid_mask[i] and pid in points3d_dict:
+            final_mask.append(True)
+        else:
+            final_mask.append(False)
+    final_mask = np.array(final_mask)
+
+    if final_mask.sum() == 0:
+        return None
+
+    pts_idx = pts_idx[final_mask]
+    valid_xys = valid_xys[final_mask]
+
+    # 获取 3D 坐标
+    pts = np.array([points3d_dict[pid] for pid in pts_idx])
+
+    # 变换到相机坐标系
+    R = qvec2rotmat(image_meta.qvec)
+    pts_cam = np.dot(pts, R.T) + image_meta.tvec
+
+    # 计算 COLMAP 深度 (z) 和 逆深度
+    # 注意: 这里计算的是 z_depth, 你的脚本用的是 1. / z
+    colmap_depth = pts_cam[..., 2]
+    invcolmapdepth = 1.0 / (colmap_depth + 1e-7)
+
+    # 读取单目深度图
+    image_basename = os.path.basename(image_meta.name)
+    image_name_no_ext = os.path.splitext(image_basename)[0]
+    depth_path = os.path.join(depths_dir, f"{image_name_no_ext}.png")
+
+    invmonodepthmap = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
+
+    if invmonodepthmap is None:
+        return None
+
+    if invmonodepthmap.ndim != 2:
+        invmonodepthmap = invmonodepthmap[..., 0]
+
+    # 归一化 Disparity (根据你的脚本 / 2**16)
+    invmonodepthmap = invmonodepthmap.astype(np.float32) / 65535.0
+
+    # 缩放因子 (适应不同分辨率)
+    s = invmonodepthmap.shape[0] / cam_intrinsic.height
+
+    # 将 COLMAP 投影点映射到 深度图 像素坐标
+    maps = (valid_xys * s).astype(np.float32)
+
+    # 边界检查
+    h_mono, w_mono = invmonodepthmap.shape
+    valid = (
+            (maps[..., 0] >= 0) * (maps[..., 1] >= 0) * (maps[..., 0] < w_mono) * (maps[..., 1] < h_mono) * (
+                invcolmapdepth > 0)
+    )
+
+    scale = 0
+    offset = 0
+
+    if valid.sum() > 10 and (invcolmapdepth.max() - invcolmapdepth.min()) > 1e-3:
+        maps = maps[valid, :]
+        invcolmapdepth = invcolmapdepth[valid]
+
+        # 采样单目深度值
+        # cv2.remap 需要 map_x, map_y，这里是稀疏点，直接用 map_coordinates 或者 bilinear sampling
+        # 为了方便，这里用 cv2.remap 的方式 (类似你原脚本) 或者直接取整/双线性插值
+        # 你的脚本使用了 remap 这种 trick，这里我们为了简单且不引入 map_x 全图，可以使用 bilinear 采样函数
+        # 但为了保持和你脚本完全一致，我们构建 map
+        # 注意: cv2.remap 通常处理整张图。对于稀疏点，直接用 opencv 获取值比较麻烦
+        # 这里为了效率，直接用 nearest 或者简单的 bilinear
+
+        # 简单 bilinear 插值实现
+        x = maps[:, 0]
+        y = maps[:, 1]
+        x0 = np.floor(x).astype(int)
+        x1 = x0 + 1
+        y0 = np.floor(y).astype(int)
+        y1 = y0 + 1
+
+        x0 = np.clip(x0, 0, w_mono - 1)
+        x1 = np.clip(x1, 0, w_mono - 1)
+        y0 = np.clip(y0, 0, h_mono - 1)
+        y1 = np.clip(y1, 0, h_mono - 1)
+
+        Ia = invmonodepthmap[y0, x0]
+        Ib = invmonodepthmap[y1, x0]
+        Ic = invmonodepthmap[y0, x1]
+        Id = invmonodepthmap[y1, x1]
+
+        wa = (x1 - x) * (y1 - y)
+        wb = (x1 - x) * (y - y0)
+        wc = (x - x0) * (y1 - y)
+        wd = (x - x0) * (y - y0)
+
+        invmonodepth = wa * Ia + wb * Ib + wc * Ic + wd * Id
+
+        ## Median / dev
+        t_colmap = np.median(invcolmapdepth)
+        s_colmap = np.mean(np.abs(invcolmapdepth - t_colmap))
+
+        t_mono = np.median(invmonodepth)
+        s_mono = np.mean(np.abs(invmonodepth - t_mono))
+
+        if s_mono > 1e-7:
+            scale = s_colmap / s_mono
+            offset = t_colmap - t_mono * scale
+
+    return {"image_name": image_name_no_ext, "scale": scale, "offset": offset}
+
 def readColmapCameras(
     cam_extrinsics: Dict, cam_intrinsics: Dict, images_folder: str,use_mono_depth=False,depth_params=None
 ) -> List[CameraInfo]:
@@ -123,14 +280,23 @@ def readColmapCameras(
         #ljx:读取da2单目深度图
         depth_mono_path = None  # 默认为 None
         if use_mono_depth:  # 只有开启了参数，才去拼凑路径
-            # dirname是images的上一级也就是root，da2和images是同级关系
             depth_folder = os.path.join(os.path.dirname(images_folder), "da2")
-            # 如果原图是jpg，深度图是png，需要替换后缀：
-            depth_mono_path = os.path.join(depth_folder, os.path.basename(extr.name).replace(".jpg", ".png"))
+            image_basename = os.path.basename(extr.name)
+            image_name_no_ext = os.path.splitext(image_basename)[0]
+            depth_mono_path = os.path.join(depth_folder, f"{image_name_no_ext}.png")
+            # =================================
+
             if not os.path.exists(depth_mono_path):
-                print(f"Warning: Depth map not found at {depth_mono_path}")
+                # 还可以加一层容错：如果 png 找不到，尝试找同名 jpg (虽然一般深度图都是png)
+                depth_mono_path_jpg = os.path.join(depth_folder, f"{image_name_no_ext}.jpg")
+                if os.path.exists(depth_mono_path_jpg):
+                    depth_mono_path = depth_mono_path_jpg
+                else:
+                    print(f"Warning: Depth map not found at {depth_mono_path}")
+                    depth_mono_path = None  # 没找到务必设为 None
             else:
-                print(f"find Depth map at {depth_mono_path}!")
+                # print(f"find Depth map at {depth_mono_path}!")
+                pass
 
         #读取深度图尺度偏移
         # [新增] 从 depth_params 字典中获取 scale 和 offset
@@ -215,15 +381,54 @@ def readColmapSceneInfo(path: str, images: str, eval: bool, llffhold: int = 8,us
         cam_intrinsics = read_intrinsics_text(cameras_intrinsic_file)
 
     #读取 sparse/0/depth_params.json
+    # [新增] 自动检测和计算 Depth Scale/Offset
     depth_params = None
     if use_mono_depth:
         json_path = os.path.join(path, "sparse/0/depth_params.json")
+
+        # 1. 尝试读取
         if os.path.exists(json_path):
-            print(f"Loading depth params from {json_path}")
+            print(f"Loading pre-computed depth params from {json_path}")
             with open(json_path, 'r') as f:
                 depth_params = json.load(f)
         else:
-            print(f"[Warning] Depth params file not found at {json_path}!")
+            # 2. 如果不存在，自动计算
+            print(f"[Info] {json_path} not found. Automatically calculating depth scales...")
+            depths_dir = os.path.join(os.path.dirname(images_folder), "da2")
+            if not os.path.exists(depths_dir):
+                print(f"[Error] Depth directory {depths_dir} not found! Cannot align depths.")
+            else:
+                # 需要读取 3D 点云字典来做对齐
+                points3d_bin = os.path.join(path, "sparse/0", "points3D.bin")
+                points3d_txt = os.path.join(path, "sparse/0", "points3D.txt")
+
+                points3d_dict = None
+                if os.path.exists(points3d_bin):
+                    points3d_dict = read_points3D_binary_dict(points3d_bin)
+                elif os.path.exists(points3d_txt):
+                    points3d_dict = read_points3D_text_dict(points3d_txt)
+
+                if points3d_dict is not None:
+                    # 并行计算 (使用 joblib)
+                    print("Computing alignment in parallel...")
+                    results = Parallel(n_jobs=-1, backend="threading")(
+                        delayed(compute_depth_scale)(
+                            key, cam_extrinsics, cam_intrinsics, points3d_dict, depths_dir
+                        ) for key in cam_extrinsics
+                    )
+
+                    # 整理结果
+                    depth_params = {}
+                    for res in results:
+                        if res is not None:
+                            depth_params[res["image_name"]] = {"scale": res["scale"], "offset": res["offset"]}
+
+                    # 保存 JSON
+                    print(f"Saving computed params to {json_path}")
+                    with open(json_path, "w") as f:
+                        json.dump(depth_params, f, indent=2)
+                else:
+                    print("[Error] Could not read points3D.bin/.txt to compute scales.")
 
 
     reading_dir = "images" if images == None else images
