@@ -253,6 +253,17 @@ def resize_tensorboard_img(
     return img
 
 
+def depth_gradient(depth):
+    # depth shape: [1, H, W]
+    # 计算 x 方向梯度: d(x+1) - d(x)
+    dy = torch.abs(depth[:, 1:, :] - depth[:, :-1, :])
+    dx = torch.abs(depth[:, :, 1:] - depth[:, :, :-1])
+
+    # 填充回原尺寸 (为了保持形状一致，简单 padding)
+    dy = torch.nn.functional.pad(dy, (0, 0, 0, 1))  # Pad H
+    dx = torch.nn.functional.pad(dx, (0, 1, 0, 0))  # Pad W
+    return dy, dx
+
 def training(
     dataset: GroupParams,
     opt: GroupParams,
@@ -415,7 +426,7 @@ def training(
         loss: torch.Tensor
         Ll1 = F.l1_loss(image, gt_image)
         normal_loss = 0.0
-        loss_depth_pos = 0.0
+        loss_mono_depth = 0.0
         loss_mono_normal = 0.0
         lambda_mono = getattr(opt, "lambda_mono", 0.1)
 
@@ -467,14 +478,48 @@ def training(
 
                     if valid_mask.sum() > 100:  # 稍微提高阈值
                         aligned_mono_depth = mono_depth
-                        # 计算差值 (此时 render_depth 和 aligned_mono_depth 都是 [1, H, W])
-                        # 结果 diff_map 也是 [1, H, W]
+
+                        # 1. [基础] Log L1 Loss (替换纯 L1)
+                        # Log 空间可以压缩数值范围，对远近物体权重更均衡，且对噪声更鲁棒
                         diff_map = torch.abs(render_depth - aligned_mono_depth)
-                        # 使用 mask 索引 (会把结果拉平成 1D 向量)
-                        loss_depth_pos = diff_map[valid_mask].mean()
-                        #loss_depth_pos = torch.log(1.0 + diff_map[valid_mask]).mean()  #log_loss
-                        loss += lambda_mono * loss_depth_pos
-                        loss_mono_depth_val = loss_depth_pos.item()
+                        loss_depth_l1 = torch.log(1.0 + diff_map[valid_mask]).mean()
+
+                        # 2. [进阶] Pearson Correlation Loss (结构一致性)
+                        # 计算两者的相关性，越接近 1 越好，Loss = 1 - Correlation
+                        # 注意：只在 valid_mask 区域内计算
+                        pred_val = render_depth[valid_mask]
+                        target_val = aligned_mono_depth[valid_mask]
+
+                        # 减均值
+                        pred_mean = pred_val - pred_val.mean()
+                        target_mean = target_val - target_val.mean()
+
+                        # 计算协方差与标准差
+                        cov = (pred_mean * target_mean).sum()
+                        pred_std = torch.sqrt((pred_mean ** 2).sum() + 1e-8)
+                        target_std = torch.sqrt((target_mean ** 2).sum() + 1e-8)
+
+                        loss_depth_pearson = 1.0 - (cov / (pred_std * target_std + 1e-8))
+
+                        # 3. [可选] Gradient Loss (边缘锐度)
+                        # 仅在迭代后期 (如 > 3000) 启用，避免初期几何不稳定时造成干扰
+                        loss_depth_grad = 0.0
+                        if iteration > 3000:
+                            grad_render_y, grad_render_x = depth_gradient(render_depth)
+                            grad_mono_y, grad_mono_x = depth_gradient(aligned_mono_depth)
+                            # 只在 mask 区域计算梯度的差异
+                            grad_diff = torch.abs(grad_render_y - grad_mono_y) + torch.abs(grad_render_x - grad_mono_x)
+                            loss_depth_grad = grad_diff[valid_mask].mean()
+
+                        # === 总深度 Loss 组合 ===
+                        # 权重建议：L1 占主导，Pearson 辅助结构，Grad 辅助细节
+                        # 例如: 0.7 * L1 + 0.3 * Pearson + 0.1 * Grad
+                        # 你可以根据实验调整 lambda_mono 的倍率
+
+                        loss_mono_depth = 0.7 * loss_depth_l1 + 0.3 * loss_depth_pearson + 0.05 * loss_depth_grad
+
+                        loss += lambda_mono * loss_mono_depth
+                        loss_mono_depth_val = loss_mono_depth.item()
 
                         # # === 关键修改 4: 法线约束 (慎用或降权) ===
                         # # 如果非要加法线约束，请使用“平滑后”的深度来计算法线
@@ -492,78 +537,169 @@ def training(
                         # # 如果发现纹理还是糊，把这个 0.1 改成 0.0 或更小
                         # loss += (lambda_mono * 0.1) * loss_mono_normal
 
-                        # ==================== [修正后的 DEBUG 代码] ====================
+                        # ==================== [深度对比 Debug 代码] ====================
                         if iteration % 100 == 0:
-                            debug_dir = os.path.join(args.model_path, "debug_normals")
+                            debug_dir = os.path.join(args.model_path, "debug_depths")
                             os.makedirs(debug_dir, exist_ok=True)
 
-                            # 1. 获取预测法线
-                            pred_vis = rendering_result["normal_map"].detach()
+                            # 1. 获取预测深度 (Rendered Depth)
+                            # [1, H, W]
+                            pred_depth = rendering_result["depth_map"].detach()
 
-                            # 2. 获取单目深度 (优先取平滑后的，没有则取原始的)
-                            if 'aligned_mono_depth_smooth' in locals():
-                                target_depth = locals()['aligned_mono_depth_smooth']
-                            elif 'aligned_mono_depth' in locals():
-                                target_depth = locals()['aligned_mono_depth']
-                            elif hasattr(viewpoint_cam, 'mono_depth_image'):
+                            # 2. 获取单目深度 (Target Depth)
+                            target_depth = None
+                            if hasattr(viewpoint_cam, 'mono_depth_image'):
                                 target_depth = viewpoint_cam.mono_depth_image
-                            else:
-                                target_depth = None
 
                             if target_depth is not None:
                                 # ---------------------------------------------------------
-                                # 手动构建内参矩阵 (Intrinsic)，避免调用不存在的属性
+                                # [修复] 健壮的维度标准化: 统统转为 [1, H, W]
                                 # ---------------------------------------------------------
-                                # 3DGS 使用的视场角转焦距公式
-                                focal_x = viewpoint_cam.image_width / (2.0 * math.tan(viewpoint_cam.FoVx / 2.0))
-                                focal_y = viewpoint_cam.image_height / (2.0 * math.tan(viewpoint_cam.FoVy / 2.0))
+                                # 1. 如果是 2维 [H, W] -> [1, H, W]
+                                if target_depth.ndim == 2:
+                                    target_depth = target_depth.unsqueeze(0)
 
-                                # 构建 3x3 内参矩阵
-                                intrinsic_matrix = torch.tensor([
-                                    [focal_x, 0, viewpoint_cam.image_width / 2.0],
-                                    [0, focal_y, viewpoint_cam.image_height / 2.0],
-                                    [0, 0, 1]
-                                ], device="cuda", dtype=torch.float32)
+                                # 2. 如果是 3维，情况比较多
+                                elif target_depth.ndim == 3:
+                                    # Case A: [H, W, 1] -> [1, H, W] (这就是报错的原因)
+                                    if target_depth.shape[2] == 1:
+                                        target_depth = target_depth.permute(2, 0, 1)
 
-                                # 获取外参 (World-to-View)，Camera 类中存的是转置过的，所以要转回来
-                                extrinsic_matrix = viewpoint_cam.world_view_transform.transpose(0, 1)
+                                    # Case B: [H, W, 3] -> 取单通道 -> [1, H, W]
+                                    elif target_depth.shape[2] == 3:
+                                        target_depth = target_depth[..., 0].unsqueeze(0)
+
+                                    # Case C: [3, H, W] -> 取单通道 -> [1, H, W]
+                                    elif target_depth.shape[0] == 3:
+                                        target_depth = target_depth[0, ...].unsqueeze(0)
+
+                                    # Case D: [1, H, W] -> 保持不变
+                                    pass
 
                                 # ---------------------------------------------------------
-                                # 调用 utils.graphics_utils 计算单目法线
+                                # 尺寸对齐 (插值)
                                 # ---------------------------------------------------------
-                                from utils.graphics_utils import normal_from_depth_image
+                                # 确保 pred_depth 也是 [1, H, W]
+                                if pred_depth.ndim == 2:
+                                    pred_depth = pred_depth.unsqueeze(0)
 
-                                # 确保深度图维度匹配 (H, W)
-                                if len(target_depth.shape) == 3:
-                                    target_depth = target_depth.squeeze()
+                                if pred_depth.shape[-2:] != target_depth.shape[-2:]:
+                                    target_depth = torch.nn.functional.interpolate(
+                                        target_depth.unsqueeze(0),
+                                        size=pred_depth.shape[-2:],
+                                        mode='bilinear',
+                                        align_corners=False
+                                    ).squeeze(0)
 
-                                # 计算 Target 法线 (利用修复后的 depth2point_world 转回世界坐标)
-                                target_vis = normal_from_depth_image(
-                                    target_depth,
-                                    intrinsic_matrix,
-                                    extrinsic_matrix
-                                ).detach()
+                                # ---------------------------------------------------------
+                                # 核心逻辑：归一化以便可视化 (Normalize to 0-1)
+                                # ---------------------------------------------------------
+                                def normalize_for_vis(d):
+                                    d_min = d.min()
+                                    d_max = d.max()
+                                    if (d_max - d_min) > 1e-8:
+                                        return (d - d_min) / (d_max - d_min)
+                                    return torch.zeros_like(d)
 
-                                # 调整维度从 [H, W, 3] 到 [3, H, W]
-                                if target_vis.shape[-1] == 3:
-                                    target_vis = target_vis.permute(2, 0, 1)
+                                # 分别归一化，侧重看“结构”是否对齐
+                                vis_pred = normalize_for_vis(pred_depth)
+                                vis_target = normalize_for_vis(target_depth)
 
-                                # 3. 归一化颜色用于可视化
-                                pred_img = (pred_vis + 1.0) * 0.5
-                                target_img = (target_vis + 1.0) * 0.5
+                                # ---------------------------------------------------------
+                                # 计算误差图 (Difference)
+                                # ---------------------------------------------------------
+                                # 直接计算数值差异，并放大亮度以便观察
+                                diff = torch.abs(pred_depth - target_depth)
+                                # 自适应归一化误差图：让误差最大的地方是白色，无误差是黑色
+                                vis_diff = normalize_for_vis(diff)
 
-                                # 4. 尺寸对齐并拼接
-                                if pred_img.shape[1:] != target_img.shape[1:]:
-                                    target_img = torch.nn.functional.interpolate(target_img.unsqueeze(0),
-                                                                                 size=pred_img.shape[1:],
-                                                                                 mode='bilinear').squeeze(0)
+                                # ---------------------------------------------------------
+                                # 拼接与保存: [预测深度 | GT深度 | 误差图]
+                                # ---------------------------------------------------------
+                                # 转为 3 通道以便 save_image 处理 (虽然是灰度，但保持格式一致)
+                                vis_pred = vis_pred.repeat(3, 1, 1)
+                                vis_target = vis_target.repeat(3, 1, 1)
 
-                                comparison = torch.cat([pred_img, target_img], dim=2)
+                                # 误差图用“热力图风格”处理一下可能更明显？这里先简单用反色或纯白表示误差
+                                # 这里用纯灰度表示：越亮误差越大
+                                vis_diff = vis_diff.repeat(3, 1, 1)
 
-                                # 5. 保存
-                                torchvision.utils.save_image(comparison, f"{debug_dir}/step_{iteration:05d}_debug.png")
-                                print(f"[DEBUG] Saved normal check to {debug_dir}/step_{iteration:05d}_debug.png")
+                                comparison = torch.cat([vis_pred, vis_target, vis_diff], dim=2)
+
+                                torchvision.utils.save_image(comparison, f"{debug_dir}/step_{iteration:05d}_depth.png")
+                                print(
+                                    f"[DEBUG] Saved depth check (Pred | Target | Diff) to {debug_dir}/step_{iteration:05d}_depth.png")
                         # ==================== [DEBUG 代码结束] ====================
+                        # # ==================== [法线对比 DEBUG 代码] ====================
+                        # if iteration % 100 == 0:
+                        #     debug_dir = os.path.join(args.model_path, "debug_normals")
+                        #     os.makedirs(debug_dir, exist_ok=True)
+                        #
+                        #     pred_vis = rendering_result["normal_map"].detach()
+                        #
+                        #     if 'aligned_mono_depth_smooth' in locals():
+                        #         target_depth = locals()['aligned_mono_depth_smooth']
+                        #     elif 'aligned_mono_depth' in locals():
+                        #         target_depth = locals()['aligned_mono_depth']
+                        #     elif hasattr(viewpoint_cam, 'mono_depth_image'):
+                        #         target_depth = viewpoint_cam.mono_depth_image
+                        #     else:
+                        #         target_depth = None
+                        #
+                        #     if target_depth is not None:
+                        #         # ---------------------------------------------------------
+                        #         # 手动构建内参矩阵 (Intrinsic)，避免调用不存在的属性
+                        #         # ---------------------------------------------------------
+                        #         # 3DGS 使用的视场角转焦距公式
+                        #         focal_x = viewpoint_cam.image_width / (2.0 * math.tan(viewpoint_cam.FoVx / 2.0))
+                        #         focal_y = viewpoint_cam.image_height / (2.0 * math.tan(viewpoint_cam.FoVy / 2.0))
+                        #
+                        #         # 构建 3x3 内参矩阵
+                        #         intrinsic_matrix = torch.tensor([
+                        #             [focal_x, 0, viewpoint_cam.image_width / 2.0],
+                        #             [0, focal_y, viewpoint_cam.image_height / 2.0],
+                        #             [0, 0, 1]
+                        #         ], device="cuda", dtype=torch.float32)
+                        #
+                        #         # 获取外参 (World-to-View)，Camera 类中存的是转置过的，所以要转回来
+                        #         extrinsic_matrix = viewpoint_cam.world_view_transform.transpose(0, 1)
+                        #
+                        #         # ---------------------------------------------------------
+                        #         # 调用 utils.graphics_utils 计算单目法线
+                        #         # ---------------------------------------------------------
+                        #         from utils.graphics_utils import normal_from_depth_image
+                        #
+                        #         # 确保深度图维度匹配 (H, W)
+                        #         if len(target_depth.shape) == 3:
+                        #             target_depth = target_depth.squeeze()
+                        #
+                        #         # 计算 Target 法线 (利用修复后的 depth2point_world 转回世界坐标)
+                        #         target_vis = normal_from_depth_image(
+                        #             target_depth,
+                        #             intrinsic_matrix,
+                        #             extrinsic_matrix
+                        #         ).detach()
+                        #
+                        #         # 调整维度从 [H, W, 3] 到 [3, H, W]
+                        #         if target_vis.shape[-1] == 3:
+                        #             target_vis = target_vis.permute(2, 0, 1)
+                        #
+                        #         # 3. 归一化颜色用于可视化
+                        #         pred_img = (pred_vis + 1.0) * 0.5
+                        #         target_img = (target_vis + 1.0) * 0.5
+                        #
+                        #         # 4. 尺寸对齐并拼接
+                        #         if pred_img.shape[1:] != target_img.shape[1:]:
+                        #             target_img = torch.nn.functional.interpolate(target_img.unsqueeze(0),
+                        #                                                          size=pred_img.shape[1:],
+                        #                                                          mode='bilinear').squeeze(0)
+                        #
+                        #         comparison = torch.cat([pred_img, target_img], dim=2)
+                        #
+                        #         # 5. 保存
+                        #         torchvision.utils.save_image(comparison, f"{debug_dir}/step_{iteration:05d}_debug.png")
+                        #         print(f"[DEBUG] Saved normal check to {debug_dir}/step_{iteration:05d}_debug.png")
+                        # # ==================== [DEBUG 代码结束] ====================
 
             # # >>>>> 结束新增 <<<<<
 
@@ -673,10 +809,10 @@ def training(
                 else:
                     normal_loss_val = normal_loss
 
-                if isinstance(loss_depth_pos, torch.Tensor):
-                    loss_mono_depth_val = loss_depth_pos.item()
+                if isinstance(loss_mono_depth, torch.Tensor):
+                    loss_mono_depth_val = loss_mono_depth.item()
                 else:
-                    loss_mono_depth_val = loss_depth_pos
+                    loss_mono_depth_val = loss_mono_depth
 
                 # if isinstance(loss_mono_normal, torch.Tensor):
                 #     loss_mono_normal_val = loss_mono_normal.item()
@@ -721,70 +857,6 @@ def training(
                     if use_mono_depth:
                         tb_writer.add_scalar('train_loss_patches/mono_depth_loss', loss_mono_depth_val, iteration)
                 #==========================================
-
-             # === 【新增】可视化调试代码 ===
-            # 每 500 次迭代，且当开启深度先验时，记录深度对齐情况到 Tensorboard
-            # if use_mono_depth and iteration % 500 == 0:
-            #     if tb_writer is not None and 'aligned_mono_depth' in locals() and mono_depth is not None:
-            #         with torch.no_grad():
-            #             def to_cmap(tensor):
-            #                 x = tensor.detach().cpu().numpy().squeeze()
-            #
-            #                 try:
-            #                     # 尝试调用 utils 中的 turbo_cmap
-            #                     from utils.general_utils import turbo_cmap
-            #                     cmap = turbo_cmap(x)
-            #                 except:
-            #                     # 简单的备用方案 (黑白)
-            #                     x_norm = (x - x.min()) / (x.max() - x.min() + 1e-5)
-            #                     cmap = np.stack([x_norm] * 3, axis=-1)
-            #
-            #                 return torch.from_numpy(cmap).permute(2, 0, 1).float().cpu()
-            #
-            #             # 渲染深度 (Rendered Depth) -> CPU
-            #             viz_render = to_cmap(render_depth)
-            #
-            #             # 原始单目深度 (Original Mono) -> CPU
-            #             viz_mono_raw = to_cmap(mono_depth)
-            #
-            #             # 对齐后的单目深度 (Aligned Mono) -> CPU
-            #             viz_mono_aligned = to_cmap(aligned_mono_depth)
-            #
-            #             # 误差图 (L1 Error)
-            #             # diff 计算是在 GPU 上进行的 (因为 render_depth 在 GPU)
-            #             diff = torch.abs(aligned_mono_depth - render_depth.squeeze())
-            #             diff = diff / (diff.mean() * 5.0 + 1e-6)
-            #             diff = torch.clamp(diff, 0, 1)
-            #
-            #             # 【关键修改】: 将 GPU 的 diff 转到 CPU
-            #             diff_cpu = diff.detach().cpu()
-            #             viz_diff = torch.stack([diff_cpu, diff_cpu, diff_cpu], dim=0)  # (3, H, W)
-            #
-            #             # 2. 写入 Tensorboard (现在所有变量都在 CPU 了)
-            #             # 拼接在一起: [Render | Mono Raw | Mono Aligned | Error]
-            #             # 确保尺寸一致再拼接 (防止 resize 导致的微小差异)
-            #             min_h = min(viz_render.shape[1], viz_mono_raw.shape[1])
-            #             min_w = min(viz_render.shape[2], viz_mono_raw.shape[2])
-            #
-            #             grid = torch.cat([
-            #                 viz_render[:, :min_h, :min_w],
-            #                 viz_mono_raw[:, :min_h, :min_w],
-            #                 viz_mono_aligned[:, :min_h, :min_w],
-            #                 viz_diff[:, :min_h, :min_w]
-            #             ], dim=2)
-            #
-            #             tb_writer.add_image("Debug_Depth/Render_Raw_Aligned_Diff", grid, iteration)
-            #
-            #             # 3. 记录对齐后的法线对比 (如果有 mono_normal)
-            #             if 'mono_normal' in locals():
-            #                 # normal 是 (3, H, W)，值域 [-1, 1]，转为 [0, 1] 显示
-            #                 # 【关键修改】: 确保都转到 CPU
-            #                 viz_n_render = (normal_map.detach().cpu() + 1) / 2
-            #                 viz_n_mono = (mono_normal.detach().cpu() + 1) / 2
-            #
-            #                 grid_norm = torch.cat([viz_n_render, viz_n_mono], dim=2)
-            #                 tb_writer.add_image("Debug_Normal/Render_vs_Mono", grid_norm, iteration)
-            #     # ===============================
 
             if iteration in saving_iterations:
                 print(f"\n[INFO] Saving Gaussian model at iteration {iteration}...")
