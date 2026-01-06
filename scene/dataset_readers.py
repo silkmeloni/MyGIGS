@@ -383,6 +383,9 @@ def readColmapSceneInfo(path: str, images: str, eval: bool, llffhold: int = 8,us
     #读取 sparse/0/depth_params.json
     # [新增] 自动检测和计算 Depth Scale/Offset
     depth_params = None
+    reading_dir = "images" if images == None else images
+    images_folder = os.path.join(path, reading_dir)
+
     if use_mono_depth:
         json_path = os.path.join(path, "sparse/0/depth_params.json")
 
@@ -431,7 +434,7 @@ def readColmapSceneInfo(path: str, images: str, eval: bool, llffhold: int = 8,us
                     print("[Error] Could not read points3D.bin/.txt to compute scales.")
 
 
-    reading_dir = "images" if images == None else images
+
 
     cam_infos_unsorted = readColmapCameras(
         cam_extrinsics=cam_extrinsics,
