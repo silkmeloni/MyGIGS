@@ -472,7 +472,7 @@ def training(
                         diff_map = torch.abs(render_depth - aligned_mono_depth)
                         # 使用 mask 索引 (会把结果拉平成 1D 向量)
                         loss_depth_pos = diff_map[valid_mask].mean()
-                        loss_depth_pos = torch.log(1.0 + diff_map[valid_mask]).mean()  #log_loss
+                        #loss_depth_pos = torch.log(1.0 + diff_map[valid_mask]).mean()  #log_loss
                         loss += lambda_mono * loss_depth_pos
                         loss_mono_depth_val = loss_depth_pos.item()
 
