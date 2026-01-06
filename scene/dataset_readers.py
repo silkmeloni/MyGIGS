@@ -83,7 +83,7 @@ def getNerfppNorm(cam_info: List[CameraInfo]) -> Dict:
 
 
 def readColmapCameras(
-    cam_extrinsics: Dict, cam_intrinsics: Dict, images_folder: str,use_mono_depth=False
+    cam_extrinsics: Dict, cam_intrinsics: Dict, images_folder: str,use_mono_depth=False,depth_params=None
 ) -> List[CameraInfo]:
     print("执行了readColmapCameras")
     cam_infos = []
@@ -132,6 +132,19 @@ def readColmapCameras(
             else:
                 print(f"find Depth map at {depth_mono_path}!")
 
+        #读取深度图尺度偏移
+        # [新增] 从 depth_params 字典中获取 scale 和 offset
+        # 默认值设为 1.0 和 0.0 (即不对齐)
+        d_scale, d_shift = 1.0, 0.0
+        if depth_params is not None:
+        # 你的脚本生成的 json key 是不带后缀的文件名，正好和 image_name 对应
+            if image_name in depth_params:
+                d_scale = depth_params[image_name]["scale"]
+                d_shift = depth_params[image_name]["offset"]
+            elif use_mono_depth:
+                print(f"[Warning] No depth params found for {image_name}")
+
+
 
         cam_info = CameraInfo(
             uid=uid,
@@ -145,6 +158,8 @@ def readColmapCameras(
             width=width,
             height=height,
             depth_mono_path=depth_mono_path,  # <--- 传入路径
+            depth_scale=d_scale,
+            depth_shift=d_shift
         )
         cam_infos.append(cam_info)
     sys.stdout.write("\n")
@@ -199,6 +214,18 @@ def readColmapSceneInfo(path: str, images: str, eval: bool, llffhold: int = 8,us
         cam_extrinsics = read_extrinsics_text(cameras_extrinsic_file)
         cam_intrinsics = read_intrinsics_text(cameras_intrinsic_file)
 
+    #读取 sparse/0/depth_params.json
+    depth_params = None
+    if use_mono_depth:
+        json_path = os.path.join(path, "sparse/0/depth_params.json")
+        if os.path.exists(json_path):
+            print(f"Loading depth params from {json_path}")
+            with open(json_path, 'r') as f:
+                depth_params = json.load(f)
+        else:
+            print(f"[Warning] Depth params file not found at {json_path}!")
+
+
     reading_dir = "images" if images == None else images
 
     cam_infos_unsorted = readColmapCameras(
@@ -206,6 +233,7 @@ def readColmapSceneInfo(path: str, images: str, eval: bool, llffhold: int = 8,us
         cam_intrinsics=cam_intrinsics,
         images_folder=os.path.join(path, reading_dir),
         use_mono_depth=use_mono_depth,
+        depth_params=depth_params
     )
     cam_infos = sorted(cam_infos_unsorted.copy(), key=lambda x: x.image_name)
 

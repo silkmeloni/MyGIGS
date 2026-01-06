@@ -436,39 +436,45 @@ def training(
 
             # 1. 设置预热步数 (Warm-up)，前 1000 步不加约束，防止 Scale 计算错误
             loss_mono_depth_val = 0.0  # 用于日志
-            if use_mono_depth and iteration > 1000:
+            if use_mono_depth: #and iteration > 1000:
                 if hasattr(viewpoint_cam, 'mono_depth_image') and viewpoint_cam.mono_depth_image is not None:
+                    # 1. 获取单目深度，确保它是 [1, H, W]
                     mono_depth = viewpoint_cam.mono_depth_image
+                    if mono_depth.ndim == 3:
+                        if mono_depth.shape[2] == 3:  # [H, W, 3] -> [1, H, W]
+                            mono_depth = mono_depth[..., 0:1].permute(2, 0, 1)
+                        elif mono_depth.shape[0] == 3:  # [3, H, W] -> [1, H, W]
+                            mono_depth = mono_depth[0:1, ...]
+                    elif mono_depth.ndim == 2:  # [H, W] -> [1, H, W]
+                        mono_depth = mono_depth.unsqueeze(0)
+
+                    # 2. 获取渲染深度，确保它是 [1, H, W]
                     render_depth = rendering_result["depth_map"]
 
-                    # GT Alpha Mask 筛选
-                    gt_alpha_mask = (viewpoint_cam.gt_alpha_mask.cuda().squeeze() > 0.5)
-                    # 过滤掉极小深度值
-                    valid_mask = (mono_depth > 1e-4) & mask.squeeze() & gt_alpha_mask
+                    # 3. 准备 Masks，确保它们都是 [1, H, W]
+                    gt_alpha_mask = viewpoint_cam.gt_alpha_mask.cuda()
+                    if gt_alpha_mask.ndim == 2:
+                        gt_alpha_mask = gt_alpha_mask.unsqueeze(0)
+
+                    # rendering_result["normal_from_depth_mask"] 通常已经是 [1, H, W]
+                    # 如果不确定，可以保险地写成:
+                    render_mask = mask
+                    if render_mask.ndim == 2:
+                        render_mask = render_mask.unsqueeze(0)
+
+                    # 4. 生成 Valid Mask (所有参与运算的 Tensor 必须都是 [1, H, W])
+                    valid_mask = (mono_depth > 1e-4) & render_mask & (gt_alpha_mask > 0.5)
 
                     if valid_mask.sum() > 100:  # 稍微提高阈值
-                        #=== 修改1: 原始几何约束权重策略 ===
-                        # 对齐深度 (Detach render_depth 防止梯度回传给 Scale 计算)
-                        aligned_mono_depth,scale,offset = align_depth_robust(mono_depth, render_depth.squeeze().detach(), valid_mask)
-
-                        # === 关键修改 2: 对单目深度进行平滑 (去噪) ===
-                        # 使用 kornia 的高斯模糊，kernel size 可以大一点 (e.g., 9x9 或 15x15)
-                        # sigma 设为 1.0 - 2.0
-                        aligned_mono_depth_smooth = kornia.filters.gaussian_blur2d(
-                            aligned_mono_depth[None, None, ...],
-                            kernel_size=(9, 9),
-                            sigma=(1.5, 1.5)
-                        ).squeeze()
-
-                        # === 关键修改 3: 优先使用深度 Loss (位置约束) ===
-                        # 这是解决几何问题的核心。即使 args.use_position_opt 没开，建议也在这里强制使用或检查
-                        # 使用 Log L1 Loss 对异常值更鲁棒
-                        diff_depth = torch.abs(render_depth.squeeze()[valid_mask] - aligned_mono_depth[valid_mask])
-                        loss_depth_pos = torch.log(1.0 + diff_depth).mean()
-
-                        # 给深度 Loss 一个较大的权重 (例如 lambda_mono)
+                        aligned_mono_depth = mono_depth
+                        # 计算差值 (此时 render_depth 和 aligned_mono_depth 都是 [1, H, W])
+                        # 结果 diff_map 也是 [1, H, W]
+                        diff_map = torch.abs(render_depth - aligned_mono_depth)
+                        # 使用 mask 索引 (会把结果拉平成 1D 向量)
+                        loss_depth_pos = diff_map[valid_mask].mean()
+                        loss_depth_pos = torch.log(1.0 + diff_map[valid_mask]).mean()  #log_loss
                         loss += lambda_mono * loss_depth_pos
-                        loss_mono_depth_val = loss_depth_pos.item()  # 记录给日志
+                        loss_mono_depth_val = loss_depth_pos.item()
 
                         # # === 关键修改 4: 法线约束 (慎用或降权) ===
                         # # 如果非要加法线约束，请使用“平滑后”的深度来计算法线
@@ -703,86 +709,82 @@ def training(
                         #f"New_N: {loss_mono_normal_val:.5f}"
                     )
 
-                # # === 【新增】记录 Loss 曲线到 TensorBoard ===
-                # if tb_writer is not None:
-                #     # 记录总 Loss
-                #     tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
-                #
-                #     # 记录原始几何 Loss
-                #     tb_writer.add_scalar('train_loss_patches/original_normal_loss', normal_loss_val, iteration)
-                #
-                #     # 记录单目深度监督 Loss (如果开启)
-                #     if use_mono_depth:
-                #         tb_writer.add_scalar('train_loss_patches/mono_depth_loss', loss_mono_normal_val, iteration)
-                # ==========================================
+                # === 【新增】记录 Loss 曲线到 TensorBoard ===
+                if tb_writer is not None:
+                    # 记录总 Loss
+                    tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
+
+                    # 记录原始几何 Loss
+                    tb_writer.add_scalar('train_loss_patches/original_normal_loss', normal_loss_val, iteration)
+
+                    # 记录单目深度监督 Loss (如果开启)
+                    if use_mono_depth:
+                        tb_writer.add_scalar('train_loss_patches/mono_depth_loss', loss_mono_depth_val, iteration)
+                #==========================================
 
              # === 【新增】可视化调试代码 ===
             # 每 500 次迭代，且当开启深度先验时，记录深度对齐情况到 Tensorboard
-            if use_mono_depth and iteration % 500 == 0:
-                if tb_writer is not None and 'aligned_mono_depth' in locals():
-                    with torch.no_grad():
-                        # 1. 准备数据
-                        # 辅助函数: 确保 tensor 转为 numpy 前在 cpu，返回的 tensor 也在 cpu
-                        def to_cmap(tensor):
-                            x = tensor.detach().cpu().numpy().squeeze()
-                            # 注意：确保 turbo_cmap 已定义或导入，如果报错未定义，请检查 utils 引用
-                            # 假设 turbo_cmap 返回 (H, W, 3) 且值域 0-1 或 0-255
-                            # 如果没有 turbo_cmap，可以用简单的 matplotlib colormap 替代
-                            try:
-                                # 尝试调用 utils 中的 turbo_cmap
-                                from utils.general_utils import turbo_cmap
-                                cmap = turbo_cmap(x)
-                            except:
-                                # 简单的备用方案 (黑白)
-                                x_norm = (x - x.min()) / (x.max() - x.min() + 1e-5)
-                                cmap = np.stack([x_norm] * 3, axis=-1)
-
-                            return torch.from_numpy(cmap).permute(2, 0, 1).float().cpu()
-
-                        # 渲染深度 (Rendered Depth) -> CPU
-                        viz_render = to_cmap(render_depth)
-
-                        # 原始单目深度 (Original Mono) -> CPU
-                        viz_mono_raw = to_cmap(mono_depth)
-
-                        # 对齐后的单目深度 (Aligned Mono) -> CPU
-                        viz_mono_aligned = to_cmap(aligned_mono_depth)
-
-                        # 误差图 (L1 Error)
-                        # diff 计算是在 GPU 上进行的 (因为 render_depth 在 GPU)
-                        diff = torch.abs(aligned_mono_depth - render_depth.squeeze())
-                        diff = diff / (diff.mean() * 5.0 + 1e-6)
-                        diff = torch.clamp(diff, 0, 1)
-
-                        # 【关键修改】: 将 GPU 的 diff 转到 CPU
-                        diff_cpu = diff.detach().cpu()
-                        viz_diff = torch.stack([diff_cpu, diff_cpu, diff_cpu], dim=0)  # (3, H, W)
-
-                        # 2. 写入 Tensorboard (现在所有变量都在 CPU 了)
-                        # 拼接在一起: [Render | Mono Raw | Mono Aligned | Error]
-                        # 确保尺寸一致再拼接 (防止 resize 导致的微小差异)
-                        min_h = min(viz_render.shape[1], viz_mono_raw.shape[1])
-                        min_w = min(viz_render.shape[2], viz_mono_raw.shape[2])
-
-                        grid = torch.cat([
-                            viz_render[:, :min_h, :min_w],
-                            viz_mono_raw[:, :min_h, :min_w],
-                            viz_mono_aligned[:, :min_h, :min_w],
-                            viz_diff[:, :min_h, :min_w]
-                        ], dim=2)
-
-                        tb_writer.add_image("Debug_Depth/Render_Raw_Aligned_Diff", grid, iteration)
-
-                        # 3. 记录对齐后的法线对比 (如果有 mono_normal)
-                        if 'mono_normal' in locals():
-                            # normal 是 (3, H, W)，值域 [-1, 1]，转为 [0, 1] 显示
-                            # 【关键修改】: 确保都转到 CPU
-                            viz_n_render = (normal_map.detach().cpu() + 1) / 2
-                            viz_n_mono = (mono_normal.detach().cpu() + 1) / 2
-
-                            grid_norm = torch.cat([viz_n_render, viz_n_mono], dim=2)
-                            tb_writer.add_image("Debug_Normal/Render_vs_Mono", grid_norm, iteration)
-                # ===============================
+            # if use_mono_depth and iteration % 500 == 0:
+            #     if tb_writer is not None and 'aligned_mono_depth' in locals() and mono_depth is not None:
+            #         with torch.no_grad():
+            #             def to_cmap(tensor):
+            #                 x = tensor.detach().cpu().numpy().squeeze()
+            #
+            #                 try:
+            #                     # 尝试调用 utils 中的 turbo_cmap
+            #                     from utils.general_utils import turbo_cmap
+            #                     cmap = turbo_cmap(x)
+            #                 except:
+            #                     # 简单的备用方案 (黑白)
+            #                     x_norm = (x - x.min()) / (x.max() - x.min() + 1e-5)
+            #                     cmap = np.stack([x_norm] * 3, axis=-1)
+            #
+            #                 return torch.from_numpy(cmap).permute(2, 0, 1).float().cpu()
+            #
+            #             # 渲染深度 (Rendered Depth) -> CPU
+            #             viz_render = to_cmap(render_depth)
+            #
+            #             # 原始单目深度 (Original Mono) -> CPU
+            #             viz_mono_raw = to_cmap(mono_depth)
+            #
+            #             # 对齐后的单目深度 (Aligned Mono) -> CPU
+            #             viz_mono_aligned = to_cmap(aligned_mono_depth)
+            #
+            #             # 误差图 (L1 Error)
+            #             # diff 计算是在 GPU 上进行的 (因为 render_depth 在 GPU)
+            #             diff = torch.abs(aligned_mono_depth - render_depth.squeeze())
+            #             diff = diff / (diff.mean() * 5.0 + 1e-6)
+            #             diff = torch.clamp(diff, 0, 1)
+            #
+            #             # 【关键修改】: 将 GPU 的 diff 转到 CPU
+            #             diff_cpu = diff.detach().cpu()
+            #             viz_diff = torch.stack([diff_cpu, diff_cpu, diff_cpu], dim=0)  # (3, H, W)
+            #
+            #             # 2. 写入 Tensorboard (现在所有变量都在 CPU 了)
+            #             # 拼接在一起: [Render | Mono Raw | Mono Aligned | Error]
+            #             # 确保尺寸一致再拼接 (防止 resize 导致的微小差异)
+            #             min_h = min(viz_render.shape[1], viz_mono_raw.shape[1])
+            #             min_w = min(viz_render.shape[2], viz_mono_raw.shape[2])
+            #
+            #             grid = torch.cat([
+            #                 viz_render[:, :min_h, :min_w],
+            #                 viz_mono_raw[:, :min_h, :min_w],
+            #                 viz_mono_aligned[:, :min_h, :min_w],
+            #                 viz_diff[:, :min_h, :min_w]
+            #             ], dim=2)
+            #
+            #             tb_writer.add_image("Debug_Depth/Render_Raw_Aligned_Diff", grid, iteration)
+            #
+            #             # 3. 记录对齐后的法线对比 (如果有 mono_normal)
+            #             if 'mono_normal' in locals():
+            #                 # normal 是 (3, H, W)，值域 [-1, 1]，转为 [0, 1] 显示
+            #                 # 【关键修改】: 确保都转到 CPU
+            #                 viz_n_render = (normal_map.detach().cpu() + 1) / 2
+            #                 viz_n_mono = (mono_normal.detach().cpu() + 1) / 2
+            #
+            #                 grid_norm = torch.cat([viz_n_render, viz_n_mono], dim=2)
+            #                 tb_writer.add_image("Debug_Normal/Render_vs_Mono", grid_norm, iteration)
+            #     # ===============================
 
             if iteration in saving_iterations:
                 print(f"\n[INFO] Saving Gaussian model at iteration {iteration}...")

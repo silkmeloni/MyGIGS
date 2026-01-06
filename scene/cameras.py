@@ -67,6 +67,8 @@ class Camera(nn.Module):
         scale: float = 1.0,
         data_device: str = "cuda",
         depth_mono_path=None, #ljx
+        depth_scale: float = 1.0,
+        depth_shift: float = 0.0,
     ) -> None:
         super(Camera, self).__init__()
 
@@ -125,26 +127,57 @@ class Camera(nn.Module):
         self.mono_depth_image = None
 
         if depth_mono_path is not None:
-            # 读取深度图，通常单目深度是单通道
-            # 注意：Depth Anything 输出通常是相对深度（disparity 或 inverse depth），或者是 metric depth
-            # 这里假设读取为 float32 的 tensor
+            # 1. 读取原始数据
+            # 你的脚本是用 cv2.IMREAD_UNCHANGED 读取 png，通常是 16bit 整数
+            # 这里用 PIL 读取并转换
             mono_depth = Image.open(depth_mono_path)
-            mono_depth = torch.from_numpy(np.array(mono_depth)).float()
+            mono_depth = torch.from_numpy(np.array(mono_depth)).float().to(self.data_device)
 
-            # 如果是RGBA或3通道，取第一通道
-            if len(mono_depth.shape) == 3:
-                mono_depth = mono_depth[:, :, 0]
+            # 2. 归一化 (关键！必须和你的脚本保持一致)
+            # 脚本里写的是: invmonodepthmap.astype(np.float32) / (2**16)
+            # 假设输入的是 Disparity (Inverse Depth)
+            mono_disp = mono_depth / 65535.0
 
-            # Resize 到和 RGB 图像一样大 (如果需要)
-            if mono_depth.shape[0] != self.image_height or mono_depth.shape[1] != self.image_width:
-                mono_depth = \
-                F.interpolate(mono_depth[None, None, ...], size=(self.image_height, self.image_width), mode='bilinear',
+            # 3. Resize (如果 RGB 和 深度图 尺寸不一致)
+            if mono_disp.shape[0] != self.image_height or mono_disp.shape[1] != self.image_width:
+                mono_disp = \
+                F.interpolate(mono_disp[None, None, ...], size=(self.image_height, self.image_width), mode='bilinear',
                               align_corners=False)[0, 0]
 
-            # 归一化处理 (建议归一化到 0-1 或标准化，这取决于你后面怎么对齐)
-            # mono_depth = (mono_depth - mono_depth.min()) / (mono_depth.max() - mono_depth.min() + 1e-5)
+            # 4. 应用预计算的 Scale 和 Shift
+            # 公式: Aligned_Disp = Scale * Mono_Disp + Shift
+            # 注意：这里的 scale/shift 已经是针对 dataset_readers 里读取的 float 值了
+            aligned_disp = mono_disp * depth_scale + depth_shift
 
-            self.mono_depth_image = mono_depth.to(data_device)
+            # 5. 转换为 Metric Depth (用于后续训练监督)
+            # 防止除以 0 或负数 (视差为0意味着无穷远)
+            aligned_disp = torch.clamp(aligned_disp, min=1e-7)
+
+            # 最终存储的是真实的深度值 (Metric Depth)
+            self.mono_depth_image = 1.0 / aligned_disp
+        else:
+            self.mono_depth_image = None
+        # if depth_mono_path is not None:
+        #     # 读取深度图，通常单目深度是单通道
+        #     # 注意：Depth Anything 输出通常是相对深度（disparity 或 inverse depth），或者是 metric depth
+        #     # 这里假设读取为 float32 的 tensor
+        #     mono_depth = Image.open(depth_mono_path)
+        #     mono_depth = torch.from_numpy(np.array(mono_depth)).float()
+        #
+        #     # 如果是RGBA或3通道，取第一通道
+        #     if len(mono_depth.shape) == 3:
+        #         mono_depth = mono_depth[:, :, 0]
+        #
+        #     # Resize 到和 RGB 图像一样大 (如果需要)
+        #     if mono_depth.shape[0] != self.image_height or mono_depth.shape[1] != self.image_width:
+        #         mono_depth = \
+        #         F.interpolate(mono_depth[None, None, ...], size=(self.image_height, self.image_width), mode='bilinear',
+        #                       align_corners=False)[0, 0]
+        #
+        #     # 归一化处理 (建议归一化到 0-1 或标准化，这取决于你后面怎么对齐)
+        #     # mono_depth = (mono_depth - mono_depth.min()) / (mono_depth.max() - mono_depth.min() + 1e-5)
+        #
+        #     self.mono_depth_image = mono_depth.to(data_device)
 
 
 class MiniCam:
