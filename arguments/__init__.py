@@ -62,6 +62,7 @@ class ModelParams(ParamGroup):
         self.eval = False
         #ljx
         self.use_mono_depth = False
+        self.use_mono_normal = False
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args: Namespace) -> GroupParams:
@@ -98,6 +99,9 @@ class OptimizationParams(ParamGroup):
         self.densify_until_iter = 15_000
         self.densify_grad_threshold = 0.0002
         self.random_background = False
+
+        self.lambda_mono = 0.0  # 这里的默认值通常给 0，表示默认关闭
+        self.lambda_mono_normal = 0.0  # 这里的默认值通常给 0，表示默认关闭
         super().__init__(parser, "Optimization Parameters")
 
 

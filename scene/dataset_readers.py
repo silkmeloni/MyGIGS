@@ -48,9 +48,11 @@ class CameraInfo(NamedTuple):
     width: int
     height: int
     depth_mono_path: str #ljx，da2的单目深度路径
+    normal_mono_path: str
     # [新增]
     depth_scale: float = 1.0
     depth_shift: float = 0.0
+
 
 
 class SceneInfo(NamedTuple):
@@ -242,7 +244,7 @@ def compute_depth_scale(key, cam_extrinsics, cam_intrinsics, points3d_dict, dept
     return {"image_name": image_name_no_ext, "scale": scale, "offset": offset}
 
 def readColmapCameras(
-    cam_extrinsics: Dict, cam_intrinsics: Dict, images_folder: str,use_mono_depth=False,depth_params=None
+    cam_extrinsics: Dict, cam_intrinsics: Dict, images_folder: str,use_mono_depth=False,depth_params=None,use_mono_normal=False
 ) -> List[CameraInfo]:
     print("执行了readColmapCameras")
     cam_infos = []
@@ -312,7 +314,27 @@ def readColmapCameras(
             elif use_mono_depth:
                 print(f"[Warning] No depth params found for {image_name}")
 
+        # [新增] 读取 OmniData 单目法线路径
+        normal_mono_path = None
+        if use_mono_normal:
+            # 假设法线文件夹叫 omni_n，与 images 同级
+            normal_folder = os.path.join(os.path.dirname(images_folder), "omni_n")
 
+            # 处理文件名 (同深度图逻辑，强制改后缀为 .png)
+            image_basename = os.path.basename(extr.name)
+            image_name_no_ext = os.path.splitext(image_basename)[0]
+            # === [修改逻辑] 优先找 _normal.png，找不到再找 .png ===
+            candidate_1 = os.path.join(normal_folder, f"{image_name_no_ext}_normal.png")
+            candidate_2 = os.path.join(normal_folder, f"{image_name_no_ext}.png")
+
+            if os.path.exists(candidate_1):
+                normal_mono_path = candidate_1
+            elif os.path.exists(candidate_2):
+                normal_mono_path = candidate_2
+            else:
+                # 两个都没找到
+                print(f"[Warning] Normal map not found. Tried: \n  1. {candidate_1}\n  2. {candidate_2}")
+                normal_mono_path = None
 
         cam_info = CameraInfo(
             uid=uid,
@@ -326,6 +348,7 @@ def readColmapCameras(
             width=width,
             height=height,
             depth_mono_path=depth_mono_path,  # <--- 传入路径
+            normal_mono_path=normal_mono_path,  # <--- 传入路径
             depth_scale=d_scale,
             depth_shift=d_shift
         )
@@ -369,7 +392,7 @@ def storePly(path: str, xyz: np.ndarray, rgb: np.ndarray) -> None:
     ply_data.write(path)
 
 
-def readColmapSceneInfo(path: str, images: str, eval: bool, llffhold: int = 8,use_mono_depth=False) -> SceneInfo:
+def readColmapSceneInfo(path: str, images: str, eval: bool, llffhold: int = 8,use_mono_depth=False,use_mono_normal=False) -> SceneInfo:
     print("执行了readColmapSceneInfo")
     try:
         cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
@@ -443,7 +466,8 @@ def readColmapSceneInfo(path: str, images: str, eval: bool, llffhold: int = 8,us
         cam_intrinsics=cam_intrinsics,
         images_folder=os.path.join(path, reading_dir),
         use_mono_depth=use_mono_depth,
-        depth_params=depth_params
+        depth_params=depth_params,
+        use_mono_normal=use_mono_normal
     )
     cam_infos = sorted(cam_infos_unsorted.copy(), key=lambda x: x.image_name)
 

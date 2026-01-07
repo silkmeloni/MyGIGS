@@ -67,6 +67,7 @@ class Camera(nn.Module):
         scale: float = 1.0,
         data_device: str = "cuda",
         depth_mono_path=None, #ljx
+        normal_mono_path=None,
         depth_scale: float = 1.0,
         depth_shift: float = 0.0,
     ) -> None:
@@ -128,8 +129,6 @@ class Camera(nn.Module):
 
         if depth_mono_path is not None:
             # 1. 读取原始数据
-            # 你的脚本是用 cv2.IMREAD_UNCHANGED 读取 png，通常是 16bit 整数
-            # 这里用 PIL 读取并转换
             mono_depth = Image.open(depth_mono_path)
             mono_depth = torch.from_numpy(np.array(mono_depth)).float().to(self.data_device)
 
@@ -150,34 +149,55 @@ class Camera(nn.Module):
             aligned_disp = mono_disp * depth_scale + depth_shift
 
             # 5. 转换为 Metric Depth (用于后续训练监督)
-            # 防止除以 0 或负数 (视差为0意味着无穷远)
             aligned_disp = torch.clamp(aligned_disp, min=1e-7)
 
             # 最终存储的是真实的深度值 (Metric Depth)
             self.mono_depth_image = 1.0 / aligned_disp
         else:
             self.mono_depth_image = None
-        # if depth_mono_path is not None:
-        #     # 读取深度图，通常单目深度是单通道
-        #     # 注意：Depth Anything 输出通常是相对深度（disparity 或 inverse depth），或者是 metric depth
-        #     # 这里假设读取为 float32 的 tensor
-        #     mono_depth = Image.open(depth_mono_path)
-        #     mono_depth = torch.from_numpy(np.array(mono_depth)).float()
-        #
-        #     # 如果是RGBA或3通道，取第一通道
-        #     if len(mono_depth.shape) == 3:
-        #         mono_depth = mono_depth[:, :, 0]
-        #
-        #     # Resize 到和 RGB 图像一样大 (如果需要)
-        #     if mono_depth.shape[0] != self.image_height or mono_depth.shape[1] != self.image_width:
-        #         mono_depth = \
-        #         F.interpolate(mono_depth[None, None, ...], size=(self.image_height, self.image_width), mode='bilinear',
-        #                       align_corners=False)[0, 0]
-        #
-        #     # 归一化处理 (建议归一化到 0-1 或标准化，这取决于你后面怎么对齐)
-        #     # mono_depth = (mono_depth - mono_depth.min()) / (mono_depth.max() - mono_depth.min() + 1e-5)
-        #
-        #     self.mono_depth_image = mono_depth.to(data_device)
+
+        # [新增] 读取单目法线
+        self.normal_mono_path = normal_mono_path
+        self.mono_normal_image = None
+
+        if normal_mono_path is not None:
+            # 1. 读取图片 (H, W, 3)
+            mono_normal = Image.open(normal_mono_path)
+            mono_normal = torch.from_numpy(np.array(mono_normal)).float() / 255.0  # 归一化到 [0, 1]
+
+            # 2. Resize
+            if mono_normal.shape[0] != self.image_height or mono_normal.shape[1] != self.image_width:
+                mono_normal = mono_normal.permute(2, 0, 1).unsqueeze(0)  # [1, 3, H, W]
+                mono_normal = F.interpolate(mono_normal, size=(self.image_height, self.image_width),
+                                            mode='bilinear', align_corners=False).squeeze(0).permute(1, 2, 0)
+
+            # 3. 转换到 [-1, 1] 范围
+            # OmniData/Leogh 输出通常是 RGB 编码的法线
+            mono_normal = mono_normal * 2.0 - 1.0
+
+            # 4. 坐标系转换 (关键!)
+            # 单目法线通常是 View Space (相机坐标系)。
+            # 3DGS 的 normal_map 通常是 World Space (世界坐标系)。
+            # 我们需要把 View Space Normal 转到 World Space。
+            # N_world = R_wc * N_view = R_cw^T * N_view
+            # self.R 是 World-to-Camera (R_cw)
+
+            # 确保 mono_normal 是 [3, H, W]
+            mono_normal = mono_normal.permute(2, 0, 1).to(self.data_device)  # [3, H, W]
+
+            # 获取旋转矩阵 (3, 3)
+            R_wc = torch.tensor(self.R.T, device=self.data_device, dtype=torch.float32)
+
+            # 批量旋转: N_world = R_wc @ N_view
+            # reshape 为 [3, H*W] 进行矩阵乘法
+            orig_shape = mono_normal.shape
+            mono_normal_flat = mono_normal.reshape(3, -1)
+            mono_normal_world = torch.matmul(R_wc, mono_normal_flat)
+            mono_normal_world = mono_normal_world.reshape(orig_shape)
+
+            # 重新归一化 (防止插值导致模长不为1)
+            mono_normal_world = F.normalize(mono_normal_world, dim=0)
+            self.mono_normal_image = mono_normal_world
 
 
 class MiniCam:

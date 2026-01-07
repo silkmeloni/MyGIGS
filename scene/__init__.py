@@ -60,10 +60,12 @@ class Scene:
         # === 【新增】 获取开关状态 ===
         # 使用 getattr 防止旧版本参数报错，默认 False
         self.use_mono_depth = getattr(args, "use_mono_depth", False)
+        self.use_mono_normal = getattr(args, "use_mono_normal", False)
         #TODO:之后其他的数据集也得传
 
         if os.path.exists(os.path.join(args.source_path, "sparse")):
-            scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval,use_mono_depth=self.use_mono_depth)
+            scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval,
+                                                          use_mono_depth=self.use_mono_depth,use_mono_normal=self.use_mono_normal)
 
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             if "stanford-orb" in args.source_path:

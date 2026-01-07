@@ -346,6 +346,8 @@ def training(
     patience_counter = 0  # 计数器
     min_depth_iter = 3000  # 最小迭代次数 (防止还没开始就停了)
 
+    print("Start training...单目深度权重为",getattr(opt, "lambda_mono", 0.1) , "单目法线权重为",getattr(opt, "lambda_mono_normal", 0.1))
+    print("深度先验：",getattr(dataset, "use_mono_depth", False),"法线先验：",getattr(dataset, "use_mono_normal", False))
 
     for iteration in range(first_iter + 1, opt.iterations + 1):  # the real iteration (1 shift)
         iter_start.record()
@@ -427,9 +429,13 @@ def training(
         Ll1 = F.l1_loss(image, gt_image)
         normal_loss = 0.0
         loss_mono_depth = 0.0
-        loss_mono_normal = 0.0
+        loss_omnidata = 0.0
         lambda_mono = getattr(opt, "lambda_mono", 0.1)
 
+        #法线
+        # 获取参数
+        use_mono_normal = getattr(dataset, "use_mono_normal", False)
+        lambda_mono_normal = getattr(args, "lambda_mono_normal", 0.05)  # 注意这里 args 的作用域
 
         if iteration <= pbr_iteration:
 
@@ -519,23 +525,6 @@ def training(
                         loss_mono_depth = 0.7 * loss_depth_l1 + 0.3 * loss_depth_pearson + 0.05 * loss_depth_grad
 
                         loss += lambda_mono * loss_mono_depth
-                        loss_mono_depth_val = loss_mono_depth.item()
-
-                        # # === 关键修改 4: 法线约束 (慎用或降权) ===
-                        # # 如果非要加法线约束，请使用“平滑后”的深度来计算法线
-                        # # 并且权重建议给得非常小 (e.g., 0.01 * lambda_mono)
-                        # # 因为 render_normal 主要是为了平滑，而 normal_tv 已经有这个作用了
-                        #
-                        # # 计算平滑后的单目法线
-                        # mono_normal_smooth = render_normal(viewpoint_cam, aligned_mono_depth_smooth, scale=1).detach()
-                        #
-                        # # 计算法线 Loss (Cos 距离通常比 L1 对法线更友好，或者继续用 L1)
-                        # # 注意：这里监督的是 normal_map (属性)，也可以尝试监督 normal_map_from_depth (几何)
-                        # loss_mono_normal = F.l1_loss(normal_map[:, valid_mask], mono_normal_smooth[:, valid_mask])
-                        #
-                        # # 给法线 Loss 一个很小的权重，避免它破坏高频纹理
-                        # # 如果发现纹理还是糊，把这个 0.1 改成 0.0 或更小
-                        # loss += (lambda_mono * 0.1) * loss_mono_normal
 
                         # ==================== [深度对比 Debug 代码] ====================
                         if iteration % 100 == 0:
@@ -623,85 +612,100 @@ def training(
                                 # 误差图用“热力图风格”处理一下可能更明显？这里先简单用反色或纯白表示误差
                                 # 这里用纯灰度表示：越亮误差越大
                                 vis_diff = vis_diff.repeat(3, 1, 1)
-
                                 comparison = torch.cat([vis_pred, vis_target, vis_diff], dim=2)
-
                                 torchvision.utils.save_image(comparison, f"{debug_dir}/step_{iteration:05d}_depth.png")
                                 print(
                                     f"[DEBUG] Saved depth check (Pred | Target | Diff) to {debug_dir}/step_{iteration:05d}_depth.png")
-                        # ==================== [DEBUG 代码结束] ====================
-                        # # ==================== [法线对比 DEBUG 代码] ====================
-                        # if iteration % 100 == 0:
-                        #     debug_dir = os.path.join(args.model_path, "debug_normals")
-                        #     os.makedirs(debug_dir, exist_ok=True)
-                        #
-                        #     pred_vis = rendering_result["normal_map"].detach()
-                        #
-                        #     if 'aligned_mono_depth_smooth' in locals():
-                        #         target_depth = locals()['aligned_mono_depth_smooth']
-                        #     elif 'aligned_mono_depth' in locals():
-                        #         target_depth = locals()['aligned_mono_depth']
-                        #     elif hasattr(viewpoint_cam, 'mono_depth_image'):
-                        #         target_depth = viewpoint_cam.mono_depth_image
-                        #     else:
-                        #         target_depth = None
-                        #
-                        #     if target_depth is not None:
-                        #         # ---------------------------------------------------------
-                        #         # 手动构建内参矩阵 (Intrinsic)，避免调用不存在的属性
-                        #         # ---------------------------------------------------------
-                        #         # 3DGS 使用的视场角转焦距公式
-                        #         focal_x = viewpoint_cam.image_width / (2.0 * math.tan(viewpoint_cam.FoVx / 2.0))
-                        #         focal_y = viewpoint_cam.image_height / (2.0 * math.tan(viewpoint_cam.FoVy / 2.0))
-                        #
-                        #         # 构建 3x3 内参矩阵
-                        #         intrinsic_matrix = torch.tensor([
-                        #             [focal_x, 0, viewpoint_cam.image_width / 2.0],
-                        #             [0, focal_y, viewpoint_cam.image_height / 2.0],
-                        #             [0, 0, 1]
-                        #         ], device="cuda", dtype=torch.float32)
-                        #
-                        #         # 获取外参 (World-to-View)，Camera 类中存的是转置过的，所以要转回来
-                        #         extrinsic_matrix = viewpoint_cam.world_view_transform.transpose(0, 1)
-                        #
-                        #         # ---------------------------------------------------------
-                        #         # 调用 utils.graphics_utils 计算单目法线
-                        #         # ---------------------------------------------------------
-                        #         from utils.graphics_utils import normal_from_depth_image
-                        #
-                        #         # 确保深度图维度匹配 (H, W)
-                        #         if len(target_depth.shape) == 3:
-                        #             target_depth = target_depth.squeeze()
-                        #
-                        #         # 计算 Target 法线 (利用修复后的 depth2point_world 转回世界坐标)
-                        #         target_vis = normal_from_depth_image(
-                        #             target_depth,
-                        #             intrinsic_matrix,
-                        #             extrinsic_matrix
-                        #         ).detach()
-                        #
-                        #         # 调整维度从 [H, W, 3] 到 [3, H, W]
-                        #         if target_vis.shape[-1] == 3:
-                        #             target_vis = target_vis.permute(2, 0, 1)
-                        #
-                        #         # 3. 归一化颜色用于可视化
-                        #         pred_img = (pred_vis + 1.0) * 0.5
-                        #         target_img = (target_vis + 1.0) * 0.5
-                        #
-                        #         # 4. 尺寸对齐并拼接
-                        #         if pred_img.shape[1:] != target_img.shape[1:]:
-                        #             target_img = torch.nn.functional.interpolate(target_img.unsqueeze(0),
-                        #                                                          size=pred_img.shape[1:],
-                        #                                                          mode='bilinear').squeeze(0)
-                        #
-                        #         comparison = torch.cat([pred_img, target_img], dim=2)
-                        #
-                        #         # 5. 保存
-                        #         torchvision.utils.save_image(comparison, f"{debug_dir}/step_{iteration:05d}_debug.png")
-                        #         print(f"[DEBUG] Saved normal check to {debug_dir}/step_{iteration:05d}_debug.png")
-                        # # ==================== [DEBUG 代码结束] ====================
 
             # # >>>>> 结束新增 <<<<<
+
+            # [新增] 单目法线监督
+            if use_mono_normal: #and iteration > 1000:  # 同样建议预热
+                if hasattr(viewpoint_cam, 'mono_normal_image') and viewpoint_cam.mono_normal_image is not None:
+                    # GT: 变换到世界坐标系的 OmniData 法线 [3, H, W]
+                    gt_normal = viewpoint_cam.mono_normal_image
+
+                    # Pred: 渲染出的法线 [3, H, W]
+                    # 注意: rendering_result["normal_map"] 通常是 World Space Normal
+                    pred_normal = rendering_result["normal_map"]
+
+                    # Mask (与深度共用，或者只用 alpha mask)
+                    # 确保 mask 维度正确 [1, H, W]
+                    valid_mask_n = (viewpoint_cam.gt_alpha_mask.cuda() > 0.5)
+
+                    if valid_mask_n.sum() > 100:
+                        # 使用 Cosine Similarity Loss 或 L1 Loss
+                        # L1 Loss: |N_pred - N_gt|
+                        loss_omnidata = F.l1_loss(pred_normal[:, valid_mask_n.squeeze()],
+                                                  gt_normal[:, valid_mask_n.squeeze()])
+
+                        # 或者 Cosine Loss: 1 - cos(theta)
+                        # loss_omnidata = (1.0 - torch.sum(pred_normal * gt_normal, dim=0)).mean()
+
+                        loss += lambda_mono_normal * loss_omnidata
+
+                        # Log (可选)
+                        if iteration % 500 == 0:
+                            print(f" [Iter {iteration}] OmniData Normal Loss: {loss_omnidata.item():.5f}")
+
+            # ==================== [新增] 单目法线 Debug 可视化 ====================
+            # 检查条件: 开启单目法线开关 + 到了保存间隔 (例如每500步)
+            if use_mono_normal and iteration % 100 == 0:
+                # 检查当前相机是否有法线图
+                if hasattr(viewpoint_cam, 'mono_normal_image') and viewpoint_cam.mono_normal_image is not None:
+
+                    debug_dir = os.path.join(args.model_path, "debug_normals")
+                    os.makedirs(debug_dir, exist_ok=True)
+
+                    with torch.no_grad():
+                        # 1. 获取预测法线 (Rendered Normal)
+                        # 3DGS 渲染出的法线通常在 [-1, 1]
+                        pred_normal = rendering_result["normal_map"].detach()  # [3, H, W]
+
+                        # 2. 获取 GT 法线 (OmniData)
+                        # 在 cameras.py 加载时应该已经转为 [-1, 1] 且旋转到了世界坐标系
+                        gt_normal = viewpoint_cam.mono_normal_image  # [3, H, W]
+
+                        # 3. 维度与尺寸对齐 (防御性编程)
+                        # 确保 GT 和 Pred 分辨率一致 (防止 Resize 导致的 mismatch)
+                        if pred_normal.shape[-2:] != gt_normal.shape[-2:]:
+                            gt_normal = torch.nn.functional.interpolate(
+                                gt_normal.unsqueeze(0),
+                                size=pred_normal.shape[-2:],
+                                mode='bilinear',
+                                align_corners=False
+                            ).squeeze(0)
+                            # 插值后重新归一化，保证模长为1
+                            gt_normal = torch.nn.functional.normalize(gt_normal, dim=0)
+
+                        # 4. 可视化转换: [-1, 1] -> [0, 1] (RGB)
+                        vis_pred = (pred_normal + 1.0) * 0.5
+                        vis_gt = (gt_normal + 1.0) * 0.5
+
+                        # 5. 计算误差图 (Angle Error / Cosine Distance)
+                        # Dot Product: 1.0 表示完全重合(无误差), -1.0 表示反向
+                        # Error = 1 - dot_product. 范围 [0, 2]. 0为黑(好), 亮为差.
+                        dot_prod = (pred_normal * gt_normal).sum(dim=0, keepdim=True)  # [1, H, W]
+                        error_map = 1.0 - torch.clamp(dot_prod, min=-1.0, max=1.0)
+
+                        # 简单的自适应亮度增强，方便观察微小误差
+                        # 如果误差都很小，除以均值会拉伸对比度
+                        error_map_vis = error_map / (error_map.mean() * 5.0 + 1e-6)
+                        error_map_vis = torch.clamp(error_map_vis, 0, 1)
+
+                        # 转为 3 通道灰度图 [3, H, W]
+                        vis_error = error_map_vis.repeat(3, 1, 1)
+
+                        # 6. 拼接: [ 渲染法线 | OmniData法线 | 角度误差图 ]
+                        comparison = torch.cat([vis_pred, vis_gt, vis_error], dim=2)
+
+                        # 7. 保存图片
+                        torchvision.utils.save_image(comparison, f"{debug_dir}/step_{iteration:05d}_normal.png")
+
+                        # 可选: 如果你想看具体的 Cosine Loss 数值
+                        # avg_cos_loss = error_map.mean().item()
+                        # print(f"[DEBUG] Saved normal check to {debug_dir}/step_{iteration:05d}_normal.png (Avg Cos Error: {avg_cos_loss:.4f})")
+            # ==================== [Debug 代码结束] ====================
 
         else:  # NOTE: PBR
             # recon occlusion
@@ -814,10 +818,10 @@ def training(
                 else:
                     loss_mono_depth_val = loss_mono_depth
 
-                # if isinstance(loss_mono_normal, torch.Tensor):
-                #     loss_mono_normal_val = loss_mono_normal.item()
-                # else:
-                #     loss_mono_normal_val = loss_mono_normal
+                if isinstance(loss_omnidata, torch.Tensor):
+                    loss_omnidata_val = loss_omnidata.item()
+                else:
+                    loss_omnidata_val = loss_omnidata
 
 
                 loss_log = {
@@ -828,7 +832,7 @@ def training(
                 # 2. 如果开启深度先验，往字典里加一项
                 if use_mono_depth:
                     loss_log["New_D"] = f"{loss_mono_depth_val:.{5}f}"
-                    # loss_log["New_N"] = f"{loss_mono_normal_val:.{5}f}"
+                    loss_log["New_N"] = f"{loss_omnidata_val:.{5}f}"
 
                 # 3. 更新进度条 (注意这里的缩进，必须在 if use_mono_depth 外面)
                 progress_bar.set_postfix(loss_log)
@@ -842,7 +846,7 @@ def training(
                         f"Loss: {loss.item():.5f} | "
                         f"Org_N: {normal_loss_val:.5f} | "
                         f"New_D: {loss_mono_depth_val:.5f}"
-                        #f"New_N: {loss_mono_normal_val:.5f}"
+                        f"New_N: {loss_omnidata_val:.5f}"
                     )
 
                 # === 【新增】记录 Loss 曲线到 TensorBoard ===
@@ -1291,10 +1295,12 @@ if __name__ == "__main__":
     parser.add_argument("--metallic", action="store_true", help="Enable metallic material reconstruction.")
     parser.add_argument("--indirect", action="store_true", help="Enable indirect diffuse modeling.")
     #ljx:单目深度 损失函数权重参数
-    parser.add_argument("--lambda_mono", default=0.0, type=float, help="Weight for mono-depth normal supervision")
+    #parser.add_argument("--lambda_mono", default=0.0, type=float, help="Weight for mono-depth normal supervision")
     # 【新增】位置约束开关
     parser.add_argument("--use_position_opt", action="store_true",
                         help="If True, optimize Gaussian positions using Depth L1/Log loss.")
+    # [新增] 单目法线 损失函数权重参数 (建议默认 0.05 或 0.1)
+    #parser.add_argument("--lambda_mono_normal", default=0.0, type=float, help="Weight for omnidata mono-normal supervision")
 
     args = parser.parse_args(sys.argv[1:])
     args.test_iterations.append(args.iterations)
