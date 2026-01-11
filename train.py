@@ -539,46 +539,52 @@ def training(
                     # 4. 生成 Valid Mask (所有参与运算的 Tensor 必须都是 [1, H, W])
                     valid_mask = (mono_depth > 1e-4) & render_mask & (gt_alpha_mask > 0.5)
 
+                    depth_loss_type = getattr(opt, "depth_loss_type", "complex")
+
                     if valid_mask.sum() > 100:  # 稍微提高阈值
                         aligned_mono_depth = mono_depth
+                        if depth_loss_type == 'l1':
+                            # 直接计算绝对误差
+                            loss_mono_depth = torch.abs(
+                                render_depth[valid_mask] - aligned_mono_depth[valid_mask]).mean()
+                        else:
+                            # 1. [基础] Log L1 Loss (替换纯 L1)
+                            # Log 空间可以压缩数值范围，对远近物体权重更均衡，且对噪声更鲁棒
+                            diff_map = torch.abs(render_depth - aligned_mono_depth)
+                            loss_depth_l1 = torch.log(1.0 + diff_map[valid_mask]).mean()
 
-                        # 1. [基础] Log L1 Loss (替换纯 L1)
-                        # Log 空间可以压缩数值范围，对远近物体权重更均衡，且对噪声更鲁棒
-                        diff_map = torch.abs(render_depth - aligned_mono_depth)
-                        loss_depth_l1 = torch.log(1.0 + diff_map[valid_mask]).mean()
+                            # 2. [进阶] Pearson Correlation Loss (结构一致性)
+                            # 计算两者的相关性，越接近 1 越好，Loss = 1 - Correlation
+                            pred_val = render_depth[valid_mask]
+                            target_val = aligned_mono_depth[valid_mask]
 
-                        # 2. [进阶] Pearson Correlation Loss (结构一致性)
-                        # 计算两者的相关性，越接近 1 越好，Loss = 1 - Correlation
-                        pred_val = render_depth[valid_mask]
-                        target_val = aligned_mono_depth[valid_mask]
+                            # 减均值
+                            pred_mean = pred_val - pred_val.mean()
+                            target_mean = target_val - target_val.mean()
 
-                        # 减均值
-                        pred_mean = pred_val - pred_val.mean()
-                        target_mean = target_val - target_val.mean()
+                            # 计算协方差与标准差
+                            cov = (pred_mean * target_mean).sum()
+                            pred_std = torch.sqrt((pred_mean ** 2).sum() + 1e-8)
+                            target_std = torch.sqrt((target_mean ** 2).sum() + 1e-8)
 
-                        # 计算协方差与标准差
-                        cov = (pred_mean * target_mean).sum()
-                        pred_std = torch.sqrt((pred_mean ** 2).sum() + 1e-8)
-                        target_std = torch.sqrt((target_mean ** 2).sum() + 1e-8)
+                            loss_depth_pearson = 1.0 - (cov / (pred_std * target_std + 1e-8))
 
-                        loss_depth_pearson = 1.0 - (cov / (pred_std * target_std + 1e-8))
+                            # 3. [可选] Gradient Loss (边缘锐度)
+                            # 仅在迭代后期 (如 > 3000) 启用，避免初期几何不稳定时造成干扰
+                            loss_depth_grad = 0.0
+                            if iteration > 3000:
+                                grad_render_y, grad_render_x = depth_gradient(render_depth)
+                                grad_mono_y, grad_mono_x = depth_gradient(aligned_mono_depth)
+                                # 只在 mask 区域计算梯度的差异
+                                grad_diff = torch.abs(grad_render_y - grad_mono_y) + torch.abs(grad_render_x - grad_mono_x)
+                                loss_depth_grad = grad_diff[valid_mask].mean()
 
-                        # 3. [可选] Gradient Loss (边缘锐度)
-                        # 仅在迭代后期 (如 > 3000) 启用，避免初期几何不稳定时造成干扰
-                        loss_depth_grad = 0.0
-                        if iteration > 3000:
-                            grad_render_y, grad_render_x = depth_gradient(render_depth)
-                            grad_mono_y, grad_mono_x = depth_gradient(aligned_mono_depth)
-                            # 只在 mask 区域计算梯度的差异
-                            grad_diff = torch.abs(grad_render_y - grad_mono_y) + torch.abs(grad_render_x - grad_mono_x)
-                            loss_depth_grad = grad_diff[valid_mask].mean()
+                            # === 总深度 Loss 组合 ===
+                            # 权重建议：L1 占主导，Pearson 辅助结构，Grad 辅助细节
+                            # 例如: 0.7 * L1 + 0.3 * Pearson + 0.1 * Grad
+                            # 你可以根据实验调整 lambda_mono 的倍率
 
-                        # === 总深度 Loss 组合 ===
-                        # 权重建议：L1 占主导，Pearson 辅助结构，Grad 辅助细节
-                        # 例如: 0.7 * L1 + 0.3 * Pearson + 0.1 * Grad
-                        # 你可以根据实验调整 lambda_mono 的倍率
-
-                        loss_mono_depth = 0.7 * loss_depth_l1 + 0.3 * loss_depth_pearson + 0.05 * loss_depth_grad
+                            loss_mono_depth = 0.7 * loss_depth_l1 + 0.3 * loss_depth_pearson + 0.05 * loss_depth_grad
 
                         loss += cur_lambda_depth * loss_mono_depth
             # # >>>>> 结束新增 <<<<<
@@ -685,8 +691,7 @@ def training(
                     comparison = torch.cat([vis_pred, vis_target, vis_diff], dim=2)
                     torchvision.utils.save_image(comparison,
                                                  f"{debug_dir}/step_{iteration:05d}_depth.png")
-                    print(
-                        f"[DEBUG] Saved depth check (Pred | Target | Diff) to {debug_dir}/step_{iteration:05d}_depth.png")
+                    #print(f"[DEBUG] Saved depth check (Pred | Target | Diff) to {debug_dir}/step_{iteration:05d}_depth.png")
 
             # ==================== 法线对比 Debug====================
             if use_mono_normal and iteration % 100 == 0:
@@ -746,7 +751,7 @@ def training(
                         torchvision.utils.save_image(vis_mask.float(),
                                                      f"{debug_dir}/step_{iteration:05d}_mask_check.png")
 
-                        print(f"[DEBUG] Mask saved. Valid pixels: {vis_mask.sum()} / {vis_mask.numel()}")
+                        #print(f"[DEBUG] Mask saved. Valid pixels: {vis_mask.sum()} / {vis_mask.numel()}")
 
                         # 6. 拼接: [渲染(Masked) | GT(Masked) | 误差(Masked)]
                         comparison = torch.cat([vis_pred_masked, vis_gt_masked, vis_error], dim=2)
