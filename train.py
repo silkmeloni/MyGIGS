@@ -275,16 +275,13 @@ def get_prior_weight(current_iter, start_iter, decay_start_iter, end_iter, base_
     """
     if current_iter < start_iter:
         return 0.0
-
     if current_iter < decay_start_iter:
         return base_weight
-
     if current_iter >= end_iter:
         return base_weight * min_ratio
 
     # 计算衰减进度 (0.0 -> 1.0)
     progress = (current_iter - decay_start_iter) / (end_iter - decay_start_iter)
-
     # 线性衰减
     # current_ratio = 1.0 - (1.0 - min_ratio) * progress
 
@@ -294,6 +291,7 @@ def get_prior_weight(current_iter, start_iter, decay_start_iter, end_iter, base_
     current_ratio = min_ratio + (1.0 - min_ratio) * cosine_progress
 
     return base_weight * current_ratio
+
 
 def training(
     dataset: GroupParams,
@@ -490,6 +488,8 @@ def training(
             args.lambda_mono_normal, normal_min_ratio
         )
 
+        cur_lambda_depth = 1.0
+        cur_lambda_normal = 1.0
 
         if iteration <= pbr_iteration:
 
@@ -543,15 +543,31 @@ def training(
 
                     if valid_mask.sum() > 100:  # 稍微提高阈值
                         aligned_mono_depth = mono_depth
+                        # ================= [改进点 1] 边缘感知权重 =================
+                        # 计算单目深度的梯度幅度
+                        dy, dx = depth_gradient(aligned_mono_depth)
+                        grad_mag = torch.sqrt(dy ** 2 + dx ** 2)
+
+                        # 归一化梯度到 0-1
+                        grad_norm = (grad_mag - grad_mag.min()) / (grad_mag.max() - grad_mag.min() + 1e-8)
+
+                        # 生成权重：梯度越大（边缘），权重越小
+                        # 这里的 5.0 是敏感度参数，可调。exp(-5x) 会让强边缘处的权重接近 0
+                        edge_weight = torch.exp(-5.0 * grad_norm)
+
                         if depth_loss_type == 'l1':
                             # 直接计算绝对误差
                             loss_mono_depth = torch.abs(
                                 render_depth[valid_mask] - aligned_mono_depth[valid_mask]).mean()
                         else:
-                            # 1. [基础] Log L1 Loss (替换纯 L1)
-                            # Log 空间可以压缩数值范围，对远近物体权重更均衡，且对噪声更鲁棒
+                            # 1. Log L1 (应用边缘降权)
                             diff_map = torch.abs(render_depth - aligned_mono_depth)
-                            loss_depth_l1 = torch.log(1.0 + diff_map[valid_mask]).mean()
+                            log_diff = torch.log(1.0 + diff_map)
+
+                            # 只在计算 mean 之前乘权重
+                            # valid_mask 区域内的平均 loss
+                            weighted_log_loss = log_diff * edge_weight
+                            loss_depth_l1 = weighted_log_loss[valid_mask].mean()
 
                             # 2. [进阶] Pearson Correlation Loss (结构一致性)
                             # 计算两者的相关性，越接近 1 越好，Loss = 1 - Correlation
@@ -590,29 +606,49 @@ def training(
             # # >>>>> 结束新增 <<<<<
 
             # [新增] 单目法线监督
-            if use_mono_normal: #and iteration > 1000:  # 同样建议预热
-                if hasattr(viewpoint_cam, 'mono_normal_image') and viewpoint_cam.mono_normal_image is not None:
-                    # GT: 变换到世界坐标系的 OmniData 法线 [3, H, W]
-                    gt_normal = viewpoint_cam.mono_normal_image
+            # ================= [Mn: 基于法线一致性的 Mask] =================
+            if use_mono_normal and hasattr(viewpoint_cam, 'mono_normal_image'):
 
-                    # Pred: 渲染出的法线 [3, H, W]
-                    # 注意: rendering_result["normal_map"] 通常是 World Space Normal
-                    pred_normal = rendering_result["normal_map"]
-                    # Mask (暂时只用alpha mask，但对于colmap数据集失效)
-                    valid_mask_n = (viewpoint_cam.gt_alpha_mask.cuda() > 0.5)
+                # 1. 获取数据 [3, H, W]
+                gt_normal = viewpoint_cam.mono_normal_image  # OmniData 先验
+                pred_normal = rendering_result["normal_map"]  # 3DGS 渲染法线
 
-                    if valid_mask_n.sum() > 100:
-                        # 使用 Cosine Similarity Loss 或 L1 Loss
-                        # L1 Loss: |N_pred - N_gt|
-                        loss_omnidata = F.l1_loss(pred_normal[:, valid_mask_n.squeeze()],
-                                                  gt_normal[:, valid_mask_n.squeeze()])
-                        # 或者 Cosine Loss: 1 - cos(theta)
-                        # loss_omnidata = (1.0 - torch.sum(pred_normal * gt_normal, dim=0)).mean()
+                # 2. 计算法线一致性 (Cosine Similarity) 参考TSGS
+                # 点积: 1.0 = 完全一致, 0.0 = 垂直, -1.0 = 反向
+                # dot: [1, H, W]
+                dot_prod = (pred_normal * gt_normal).sum(dim=0, keepdim=True)
 
-                        loss += cur_lambda_normal * loss_omnidata
-                        # Log (可选)
-                        if iteration % 500 == 0:
-                            print(f" [Iter {iteration}] OmniData Normal Loss: {loss_omnidata.item():.5f}")
+                # 3. 生成 Mn (Consistency Mask)
+                # 逻辑：只监督那些方向“大体一致”的区域，剔除完全离谱的 Outliers
+                # 这里的阈值 (consistency_thresh) 决定了容忍度
+                # 例如 0.5 表示：夹角小于 60 度才算有效，超过 60 度认为是先验错误/遮挡，不给 Loss
+                consistency_thresh = 0.5
+                Mn_consistency = (dot_prod > consistency_thresh).float()
+
+                # 4. 结合物体 Mask (GT Alpha)
+                gt_alpha_mask = (viewpoint_cam.gt_alpha_mask.cuda() > 0.5).float()
+                if gt_alpha_mask.ndim == 2: gt_alpha_mask = gt_alpha_mask.unsqueeze(0)
+
+                # 最终 Mask = 法线一致性 * 物体掩码
+                Mn = Mn_consistency * gt_alpha_mask
+
+                # ================= [计算 Loss] =================
+                if Mn.sum() > 100:
+                    # 使用 1-NN Loss
+                    # 注意：这里我们用截断后的 dot_prod 来算 Loss
+                    dot_clamped = torch.clamp(dot_prod, min=-1.0, max=1.0)
+                    loss_cosine = 1.0 - dot_clamped
+
+                    # 只在 Mn 区域内计算
+                    # 这样做的效果：只有当 3DGS 的法线和 OmniData 法线“稍微有点像”的时候，
+                    # 我们才推它一把让它“更像”。如果完全不像，就放过它（避免被错误先验带偏）。
+                    loss_omnidata = (loss_cosine * Mn).sum() / (Mn.sum() + 1e-6)
+
+                    loss += cur_lambda_normal * loss_omnidata
+
+                    # (可选) Debug
+                    # if iteration % 1000 == 0:
+                    #     print(f"Normal Consistency Kept: {Mn.sum()/gt_alpha_mask.sum():.2%}")
 
             # ==================== 深度对比 Debug====================
             if use_mono_depth and iteration % 100 == 0:
@@ -1404,4 +1440,4 @@ if __name__ == "__main__":
     )
 
     # All done
-    print("\nTraining complete.")
+   
