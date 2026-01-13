@@ -488,8 +488,8 @@ def training(
             args.lambda_mono_normal, normal_min_ratio
         )
 
-        cur_lambda_depth = 1.0
-        cur_lambda_normal = 1.0
+        #cur_lambda_depth = 1.0
+        #cur_lambda_normal = 1.0
 
         if iteration <= pbr_iteration:
 
