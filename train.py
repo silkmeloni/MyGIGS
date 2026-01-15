@@ -602,7 +602,20 @@ def training(
 
                             loss_mono_depth = 0.7 * loss_depth_l1 + 0.3 * loss_depth_pearson + 0.05 * loss_depth_grad
 
-                        loss += cur_lambda_depth * loss_mono_depth
+                        #单帧异常剔除
+                        depth_loss_threshold = 1.5
+                        current_depth_loss_val = loss_mono_depth.item()
+                        if current_depth_loss_val > depth_loss_threshold:
+                            # 只有在偶尔打印日志时才警告，防止刷屏
+                            if iteration % 100 == 0:
+                                print(
+                                    f"[Warning Iter {iteration}] Depth Loss ({current_depth_loss_val:.4f}) > {depth_loss_threshold}. Ignoring depth prior for this frame.")
+
+                            # 【核心】直接归零，不加到总 loss 里
+                            loss_mono_depth = 0.0
+                        else:
+                            # 正常情况：应用权重并累加
+                            loss += cur_lambda_depth * loss_mono_depth
             # # >>>>> 结束新增 <<<<<
 
             # [新增] 单目法线监督
@@ -644,7 +657,21 @@ def training(
                     # 我们才推它一把让它“更像”。如果完全不像，就放过它（避免被错误先验带偏）。
                     loss_omnidata = (loss_cosine * Mn).sum() / (Mn.sum() + 1e-6)
 
-                    loss += cur_lambda_normal * loss_omnidata
+                    # ================= 单帧异常剔除 =================
+                    # 设定阈值。Cosine Loss 范围是 [0, 2]。
+                    # 0.6 表示平均误差很大 (约等于平均夹角很大)，通常意味着方向全反了或坐标系不对
+                    normal_loss_threshold = 0.6
+                    current_normal_loss_val = loss_omnidata.item()
+                    if current_normal_loss_val > normal_loss_threshold:
+                        if iteration % 100 == 0:
+                            print(
+                                f"[Warning Iter {iteration}] Normal Loss ({current_normal_loss_val:.4f}) > {normal_loss_threshold}. Ignoring normal prior for this frame.")
+
+                        # 【核心】直接归零
+                        loss_omnidata = 0.0
+                    else:
+                        # 正常情况
+                        loss += lambda_mono_normal * loss_omnidata
 
                     # (可选) Debug
                     # if iteration % 1000 == 0:
