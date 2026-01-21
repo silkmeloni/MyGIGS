@@ -95,3 +95,38 @@ def _ssim(
         return ssim_map.mean()
     else:
         return ssim_map.mean(1).mean(1).mean(1)
+
+
+# ... (现有代码保持不变)
+
+# 【新增】双边平滑损失函数
+def bilateral_smoothness_loss(roughness: torch.Tensor, image: torch.Tensor, lambda_edge: float = 10.0) -> torch.Tensor:
+    """
+    roughness: [1, H, W] 预测的粗糙度图
+    image: [3, H, W] 引导图像 (通常是 GT Image 或 Albedo)，用于检测边缘
+    lambda_edge: 控制边缘敏感度，值越大，边缘处的平滑权重越小 (越允许突变)
+    """
+    # 1. 计算 Roughness 的梯度 (H 和 W 方向)
+    # [1, H, W-1]
+    d_rough_x = torch.abs(roughness[:, :, :-1] - roughness[:, :, 1:])
+    # [1, H-1, W]
+    d_rough_y = torch.abs(roughness[:, :-1, :] - roughness[:, 1:, :])
+
+    # 2. 计算引导 Image 的梯度 (取 RGB 平均变成灰度，或者保持 3 通道取最大值)
+    # 这里简单取 RGB 平均作为亮度/结构引导
+    img_gray = image.mean(dim=0, keepdim=True)  # [1, H, W]
+
+    d_img_x = torch.abs(img_gray[:, :, :-1] - img_gray[:, :, 1:])  # [1, H, W-1]
+    d_img_y = torch.abs(img_gray[:, :-1, :] - img_gray[:, 1:, :])  # [1, H-1, W]
+
+    # 3. 计算双边权重
+    # 图像梯度越大 (边缘)，exp(-x) 越接近 0 -> 权重越小 -> 允许 Roughness 不平滑
+    # 图像梯度越小 (平坦)，exp(-x) 越接近 1 -> 权重越大 -> 强迫 Roughness 平滑
+    weights_x = torch.exp(-lambda_edge * d_img_x)
+    weights_y = torch.exp(-lambda_edge * d_img_y)
+
+    # 4. 加权求和
+    loss_x = (weights_x * d_rough_x).mean()
+    loss_y = (weights_y * d_rough_y).mean()
+
+    return loss_x + loss_y

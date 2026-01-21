@@ -25,7 +25,7 @@ from pbr import CubemapLight, get_brdf_lut, pbr_shading
 from scene import GaussianModel, Scene, Camera
 from utils.general_utils import safe_state
 from utils.image_utils import psnr, turbo_cmap, erode
-from utils.loss_utils import l1_loss, ssim, get_img_grad_weight
+from utils.loss_utils import l1_loss, ssim, get_img_grad_weight, bilateral_smoothness_loss
 from utils.graphics_utils import normal_from_depth_image
 
 import torchvision
@@ -900,9 +900,25 @@ def training(
                     step=1,
                 )
             loss += brdf_tv_loss * brdf_tv_weight
-            lamb_weight = 0.001
+            lamb_weight = 0.01
             lamb_loss = (1.0 - roughness_map[normal_mask]).mean() + metallic_map[normal_mask].mean()
             loss += lamb_loss * lamb_weight
+
+            # ================= [新增] 方案一：双边平滑材质正则化 =================
+            # 只有当参数开启且在 mask 区域内有像素时才计算
+            if args.use_bilateral_loss and (normal_mask.sum() > 0):
+                # 使用 gt_image 作为纹理引导
+                loss_bi_smooth = bilateral_smoothness_loss(
+                    roughness_map,
+                    gt_image,
+                    lambda_edge=args.bilateral_edge_decay
+                )
+                loss += loss_bi_smooth * args.lambda_bilateral
+
+                # (可选) 如果想监控这个 Loss 的数值，可以打印或记录到 TensorBoard
+                if iteration % 1000 == 0:
+                    print(f"[Iter {iteration}] Bilateral Loss: {loss_bi_smooth.item():.5f}")
+            # ==================================================================
 
             #### envmap
             # TV smoothness
@@ -959,15 +975,15 @@ def training(
                 progress_bar.update(10)
 
                 #额外打印，用于回看
-                if iteration % 500 == 0:
-                    # 格式：[Iter 1500] Loss: 0.12345 | Org_N: 0.05000 | New_D: 0.02000
-                    print(
-                        f"\n[Iter {iteration:05d}] "
-                        f"Loss: {loss.item():.5f} | "
-                        f"Org_N: {normal_loss_val:.5f} | "
-                        f"New_D: {loss_mono_depth_val:.5f}"
-                        f"New_N: {loss_omnidata_val:.5f}"
-                    )
+                # if iteration % 500 == 0:
+                #     # 格式：[Iter 1500] Loss: 0.12345 | Org_N: 0.05000 | New_D: 0.02000
+                #     print(
+                #         f"\n[Iter {iteration:05d}] "
+                #         f"Loss: {loss.item():.5f} | "
+                #         f"Org_N: {normal_loss_val:.5f} | "
+                #         f"New_D: {loss_mono_depth_val:.5f}"
+                #         f"New_N: {loss_omnidata_val:.5f}"
+                #     )
 
                 # === 【新增】记录 Loss 曲线到 TensorBoard ===
                 if tb_writer is not None:
@@ -1415,12 +1431,18 @@ if __name__ == "__main__":
     parser.add_argument("--metallic", action="store_true", help="Enable metallic material reconstruction.")
     parser.add_argument("--indirect", action="store_true", help="Enable indirect diffuse modeling.")
     #ljx:单目深度 损失函数权重参数
-    #parser.add_argument("--lambda_mono", default=0.0, type=float, help="Weight for mono-depth normal supervision")
     # 【新增】位置约束开关
     parser.add_argument("--use_position_opt", action="store_true",
                         help="If True, optimize Gaussian positions using Depth L1/Log loss.")
-    # [新增] 单目法线 损失函数权重参数 (建议默认 0.05 或 0.1)
-    #parser.add_argument("--lambda_mono_normal", default=0.0, type=float, help="Weight for omnidata mono-normal supervision")
+    # 【新增】是否启用双边平滑 Loss
+    parser.add_argument("--use_bilateral_loss", action="store_true",
+                        help="Enable bilateral smoothness loss for roughness consistency.")
+    # 【新增】双边平滑 Loss 的权重 (建议默认 0.1 - 1.0)
+    parser.add_argument("--lambda_bilateral", default=0.1, type=float, help="Weight for bilateral smoothness loss.")
+    # 【新增】边缘敏感度 (建议默认 10.0)
+    parser.add_argument("--bilateral_edge_decay", default=10.0, type=float,
+                        help="Edge sensitivity for bilateral loss. Higher keeps edges sharper.")
+
 
     args = parser.parse_args(sys.argv[1:])
     args.test_iterations.append(args.iterations)
