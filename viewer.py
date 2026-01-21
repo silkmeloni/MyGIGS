@@ -12,7 +12,7 @@ from torch import nn
 # ==============================================================================
 # TODO: 请确认这里是你的 GI-GS 项目根目录
 # ==============================================================================
-PROJECT_PATH = "D:/Projects/MyGIGS"  # <--- 请务必根据实际路径修改！
+PROJECT_PATH = "D:/Projects/MyGIGS"
 if PROJECT_PATH not in sys.path:
     sys.path.append(PROJECT_PATH)
 
@@ -45,8 +45,6 @@ class MiniCam:
         self.FoVx = fovx
         self.znear = znear
         self.zfar = zfar
-
-        # 计算 View Matrix (World -> Camera)
         w2c = torch.inverse(c2w).cuda()
         self.world_view_transform = w2c.transpose(0, 1)
         self.projection_matrix = getProjectionMatrix(znear, zfar, fovx, fovy).transpose(0, 1).cuda()
@@ -95,7 +93,7 @@ def quaternion_to_matrix(quaternions):
 
 
 # ==============================================================================
-# 3. 安全 PBR Shader
+# 3. PBR Shader
 # ==============================================================================
 def safe_pbr_shading(albedo, normal, roughness, metallic, light_pos, view_pos):
     albedo = torch.nan_to_num(albedo, 0.0).clamp(0, 1)
@@ -106,11 +104,9 @@ def safe_pbr_shading(albedo, normal, roughness, metallic, light_pos, view_pos):
     N = F.normalize(normal, dim=0)
     L_dir = F.normalize(light_pos, dim=0).view(3, 1, 1)
     L = L_dir.expand_as(N)
-
     NdotL = (N * L).sum(0, keepdim=True).clamp(0, 1)
     diffuse = albedo * (1.0 - metallic)
 
-    # 环境光 (模拟天空光)
     up_vec = torch.tensor([0.0, 1.0, 0.0], device="cuda").view(3, 1, 1)
     NdotUp = (N * up_vec).sum(0, keepdim=True) * 0.5 + 0.5
     sky_color = torch.tensor([0.2, 0.3, 0.5], device="cuda").view(3, 1, 1)
@@ -119,7 +115,6 @@ def safe_pbr_shading(albedo, normal, roughness, metallic, light_pos, view_pos):
     ambient = albedo * ambient_val * 0.3
 
     specular = metallic * NdotL * 0.8
-
     color = ambient + (diffuse + specular) * NdotL * 1.5
     return color.clamp(0, 1)
 
@@ -132,6 +127,7 @@ def main(args):
         print(f"[Error] 找不到文件: {args.ply_path}")
         return
 
+    print(f"启动 Viser Server (Port: {args.port})...")
     server = viser.ViserServer(port=args.port)
     server.gui.configure_theme(control_layout="collapsible")
 
@@ -143,16 +139,21 @@ def main(args):
     pipe = ViewerPipeline()
 
     # --- UI ---
-    with server.gui.add_folder("Settings"):
-        # 【新增】FPS 显示
+    with server.gui.add_folder("Performance & Stats"):
+        gui_resolution = server.gui.add_slider("Max Resolution", min=100, max=1600, step=100, initial_value=600)
+        # 禁用 Quality 滑块以兼容旧版 Viser
+        gui_jpeg_quality = server.gui.add_slider("JPEG Quality (Disabled)", min=10, max=100, step=10, initial_value=50,
+                                                 disabled=True)
         gui_fps = server.gui.add_number("FPS", initial_value=0.0, disabled=True)
 
+    with server.gui.add_folder("Settings"):
         gui_point_cloud_mode = server.gui.add_checkbox("Debug: Show Point Cloud", initial_value=False)
 
+        # 【新增】Traditional 3DGS 选项
         gui_mode = server.gui.add_dropdown(
             "Render Mode",
-            options=["Albedo (Base Color)", "PBR Shading", "Normal", "Opacity"],
-            initial_value="Albedo (Base Color)"
+            options=["PBR Shading", "Traditional 3DGS", "Albedo", "Normal", "Opacity"],
+            initial_value="PBR Shading"
         )
 
         gui_bg = server.gui.add_rgb("Background", (50, 50, 50))
@@ -164,14 +165,13 @@ def main(args):
 
     pcd_handle = None
 
-    # --- Debug Point Cloud Logic ---
     @gui_point_cloud_mode.on_update
     def _(_):
         nonlocal pcd_handle
         if gui_point_cloud_mode.value:
             xyz = gaussians.get_xyz.detach().cpu().numpy()
             shs = gaussians.get_features.detach().cpu().numpy()
-            colors = shs[:, 0, :] * 0.28209479177387814 + 0.5
+            colors = shs[:, 0, :] * 0.282 + 0.5
             colors = np.clip(colors, 0, 1)
             pcd_handle = server.scene.add_point_cloud("/debug_pcd", points=xyz, colors=colors, point_size=0.01)
         else:
@@ -179,10 +179,9 @@ def main(args):
                 pcd_handle.remove()
                 pcd_handle = None
 
-    # --- Render Loop ---
+    # --- 渲染循环 ---
     @server.on_client_connect
     def _(client: viser.ClientHandle):
-        # 【新增】用于计算 FPS 的状态变量
         last_time = time.time()
 
         @client.camera.on_update
@@ -192,82 +191,65 @@ def main(args):
             if gui_point_cloud_mode.value:
                 return
 
-            # 1. 准备矩阵
             c2w = torch.eye(4, dtype=torch.float32)
             q = torch.tensor(cam.wxyz).unsqueeze(0)
             R = quaternion_to_matrix(q).squeeze(0)
             c2w[:3, :3] = R
             c2w[:3, 3] = torch.tensor(cam.position)
 
-            W = 800
+            target_width = gui_resolution.value
+            W = target_width
             H = int(W / cam.aspect)
 
-            viewpoint_cam = MiniCam(
-                c2w=c2w, width=W, height=H, fovy=cam.fov,
-                fovx=2 * math.atan(math.tan(cam.fov / 2) * cam.aspect)
-            )
-
+            viewpoint_cam = MiniCam(c2w=c2w, width=W, height=H, fovy=cam.fov,
+                                    fovx=2 * math.atan(math.tan(cam.fov / 2) * cam.aspect))
             bg_color = torch.tensor(gui_bg.value, dtype=torch.float32, device="cuda") / 255.0
 
-            # 2. Rasterization
             try:
-                render_pkg = render(
-                    viewpoint_camera=viewpoint_cam,
-                    pc=gaussians,
-                    pipe=pipe,
-                    bg_color=bg_color,
-                    inference=True
-                )
-            except Exception as e:
+                render_pkg = render(viewpoint_cam, gaussians, pipe, bg_color, inference=True)
+            except Exception:
                 return
 
-            # 3. Buffer Extraction
             image_raw = render_pkg["render"]
-            try:
-                albedo = render_pkg["albedo_map"]
-                normal = render_pkg["normal_map"]
-                roughness = render_pkg["roughness_map"]
-                metallic = render_pkg["metallic_map"]
-                opacity = render_pkg["opacity_map"]
-            except KeyError:
-                img_np = image_raw.permute(1, 2, 0).detach().cpu().numpy()
-                client.set_background_image(img_np)
-                return
-
-            # 4. Compositing
             mode = gui_mode.value
 
-            if mode == "PBR Shading":
-                light_p = torch.tensor(gui_light.position, dtype=torch.float32, device="cuda")
-                cam_p = viewpoint_cam.camera_center
-                r_mod = roughness * gui_roughness.value
-                m_mod = metallic * gui_metallic.value
+            try:
+                if mode == "PBR Shading":
+                    light_p = torch.tensor(gui_light.position, dtype=torch.float32, device="cuda")
+                    shaded = safe_pbr_shading(render_pkg["albedo_map"], render_pkg["normal_map"],
+                                              render_pkg["roughness_map"] * gui_roughness.value,
+                                              render_pkg["metallic_map"] * gui_metallic.value,
+                                              light_p, viewpoint_cam.camera_center)
+                    final_image = shaded * render_pkg["opacity_map"] + bg_color[:, None, None] * (
+                                1 - render_pkg["opacity_map"])
 
-                shaded = safe_pbr_shading(albedo, normal, r_mod, m_mod, light_p, cam_p)
-                final_image = shaded * opacity + bg_color[:, None, None] * (1 - opacity)
+                # 【新增】传统渲染模式：直接显示 rasterizer 的 render 结果
+                elif mode == "Traditional 3DGS":
+                    final_image = image_raw
 
-            elif mode == "Albedo (Base Color)":
-                final_image = albedo * opacity + bg_color[:, None, None] * (1 - opacity)
-
-            elif mode == "Normal":
-                final_image = (normal + 1) * 0.5 * opacity + bg_color[:, None, None] * (1 - opacity)
-
-            elif mode == "Opacity":
-                final_image = opacity.repeat(3, 1, 1)
-
-            else:
+                elif mode == "Normal":
+                    final_image = (render_pkg["normal_map"] + 1) * 0.5 * render_pkg["opacity_map"] + bg_color[:, None,
+                                                                                                     None] * (
+                                              1 - render_pkg["opacity_map"])
+                elif mode == "Opacity":
+                    final_image = render_pkg["opacity_map"].repeat(3, 1, 1)
+                elif mode == "Albedo":
+                    final_image = render_pkg["albedo_map"] * render_pkg["opacity_map"] + bg_color[:, None, None] * (
+                                1 - render_pkg["opacity_map"])
+                else:
+                    final_image = image_raw
+            except KeyError:
                 final_image = image_raw
 
             img_np = final_image.permute(1, 2, 0).clamp(0, 1).detach().cpu().numpy()
-            client.set_background_image(img_np)
 
-            # 【新增】FPS 计算与更新
-            now = time.time()
-            dt = now - last_time
-            last_time = now
+            client.set_background_image(img_np, format="jpeg")
+
+            t_send = time.time()
+            dt = t_send - last_time
+            last_time = t_send
             if dt > 0:
                 fps = 1.0 / dt
-                # 为了防止数字跳变太快看不清，可以选择平滑处理，这里直接显示实时值
                 gui_fps.value = round(fps, 1)
 
     while True:
@@ -276,9 +258,8 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--ply_path", type=str, required=True, help="Path to .ply file")
+    parser.add_argument("--ply_path", type=str, required=True)
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--sh_degree", type=int, default=3)
     args = parser.parse_args()
-
     main(args)
