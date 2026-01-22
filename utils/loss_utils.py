@@ -130,3 +130,77 @@ def bilateral_smoothness_loss(roughness: torch.Tensor, image: torch.Tensor, lamb
     loss_y = (weights_y * d_rough_y).mean()
 
     return loss_x + loss_y
+
+
+def rgb_to_hsv(image: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """
+    可微分的 RGB -> HSV 转换
+    image: [C, H, W] or [B, C, H, W], range [0, 1]
+    Return: [C, H, W], (H=0~1, S=0~1, V=0~1)
+    """
+    if image.dim() == 3:
+        image = image.unsqueeze(0)  # [1, 3, H, W]
+
+    r, g, b = image[:, 0], image[:, 1], image[:, 2]
+
+    max_val, _ = torch.max(image, dim=1)
+    min_val, _ = torch.min(image, dim=1)
+    diff = max_val - min_val
+
+    # 1. 计算 Value
+    v = max_val
+
+    # 2. 计算 Saturation
+    # 如果 max=0 (全黑), s=0; 否则 s = diff / max
+    s = torch.where(max_val > eps, diff / (max_val + eps), torch.zeros_like(max_val))
+
+    # 3. 计算 Hue
+    # 这是一个分段函数，需要用 mask 处理
+    # 如果 diff=0 (灰度), h=0
+
+    mask_r = (max_val == r) & (diff > eps)
+    mask_g = (max_val == g) & (diff > eps)
+    mask_b = (max_val == b) & (diff > eps)
+
+    h = torch.zeros_like(max_val)
+
+    # H calculation
+    h[mask_r] = (g[mask_r] - b[mask_r]) / (diff[mask_r] + eps) % 6
+    h[mask_g] = (b[mask_g] - r[mask_g]) / (diff[mask_g] + eps) + 2
+    h[mask_b] = (r[mask_b] - g[mask_b]) / (diff[mask_b] + eps) + 4
+
+    h = h / 6.0  # Normalize to [0, 1]
+
+    return torch.stack([h, s, v], dim=1).squeeze(0)  # Back to [3, H, W]
+
+
+def hsv_albedo_loss(albedo: torch.Tensor, gt_image: torch.Tensor, lambda_h: float = 1.0, lambda_s: float = 0.5,
+                    lambda_v: float = 0.0) -> torch.Tensor:
+    """
+    基于 HSV 的解耦 Loss
+    - 强约束 H (色相)
+    - 弱约束 S (饱和度)
+    - 不约束或平滑约束 V (亮度)
+    """
+    # 转换空间
+    hsv_pred = rgb_to_hsv(albedo)
+    hsv_gt = rgb_to_hsv(gt_image.detach())  # 别让梯度传回 GT
+
+    h_pred, s_pred, v_pred = hsv_pred[0], hsv_pred[1], hsv_pred[2]
+    h_gt, s_gt, v_gt = hsv_gt[0], hsv_gt[1], hsv_gt[2]
+
+    # 1. Hue Loss (注意 Hue 是环形的, 0.0 和 1.0 是一样的)
+    # 计算最小环形距离: min(|a-b|, 1-|a-b|)
+    diff_h = torch.abs(h_pred - h_gt)
+    loss_h = torch.min(diff_h, 1.0 - diff_h).mean()
+
+    # 2. Saturation Loss
+    # 可以直接用 L1, 但高光区域 GT 的 Saturation 会变小, 我们不希望 Albedo 跟着变小
+    # 所以可以加一个权重: 只在 GT Saturation 较大(有颜色)的地方强约束
+    # 简单起见，先用全局 L1
+    loss_s = torch.abs(s_pred - s_gt).mean()
+    d_v_x = torch.abs(v_pred[:, :-1] - v_pred[:, 1:])
+    d_v_y = torch.abs(v_pred[:-1, :] - v_pred[1:, :])
+    loss_v_smooth = d_v_x.mean() + d_v_y.mean()
+
+    return lambda_h * loss_h + lambda_s * loss_s + lambda_v * loss_v_smooth

@@ -25,7 +25,7 @@ from pbr import CubemapLight, get_brdf_lut, pbr_shading
 from scene import GaussianModel, Scene, Camera
 from utils.general_utils import safe_state
 from utils.image_utils import psnr, turbo_cmap, erode
-from utils.loss_utils import l1_loss, ssim, get_img_grad_weight, bilateral_smoothness_loss
+from utils.loss_utils import l1_loss, ssim, get_img_grad_weight, bilateral_smoothness_loss, hsv_albedo_loss
 from utils.graphics_utils import normal_from_depth_image
 
 import torchvision
@@ -904,21 +904,44 @@ def training(
             lamb_loss = (1.0 - roughness_map[normal_mask]).mean() + metallic_map[normal_mask].mean()
             loss += lamb_loss * lamb_weight
 
-            # ================= [新增] 方案一：双边平滑材质正则化 =================
-            # 只有当参数开启且在 mask 区域内有像素时才计算
-            if args.use_bilateral_loss and (normal_mask.sum() > 0):
-                # 使用 gt_image 作为纹理引导
-                loss_bi_smooth = bilateral_smoothness_loss(
-                    roughness_map,
-                    gt_image,
-                    lambda_edge=args.bilateral_edge_decay
-                )
-                loss += loss_bi_smooth * args.lambda_bilateral
-
-                # (可选) 如果想监控这个 Loss 的数值，可以打印或记录到 TensorBoard
-                if iteration % 1000 == 0:
-                    print(f"[Iter {iteration}] Bilateral Loss: {loss_bi_smooth.item():.5f}")
             # ==================================================================
+            # [Feature] HSV约束
+            # ==================================================================
+            if args.lambda_hsv > 0 and (normal_mask.sum() > 0):
+                # 使用 HSV Loss 约束 Albedo
+                # 这里的参数很有讲究:
+                # lambda_h=1.0: 强迫色相一致 (颜色不能偏)
+                # lambda_s=0.5: 饱和度大概一致就行
+                # lambda_v=0.1: 对亮度只做平滑约束 (TV Loss), 绝对不要让它去拟合 GT 的亮度值！
+                loss_hsv = hsv_albedo_loss(
+                    albedo_map,
+                    gt_image,
+                    lambda_h=1.0,
+                    lambda_s=0.5,
+                    lambda_v=0.1
+                )
+                loss += loss_hsv * args.lambda_hsv
+
+
+            # ==================================================================
+            # [Feature] 全局双边平滑约束 (Global Bilateral Smoothness)
+            # 目标: Albedo, Roughness, Metallic, Normal
+            # ==================================================================
+            if args.lambda_bilateral > 0 and (normal_mask.sum() > 0):
+                # 1. 准备引导图 (GT Image 是最稳的 Ground Truth)
+                # detach 很重要，防止梯度传回 GT 导致逻辑混乱，虽然 GT 本身也没梯度
+                guide_img = gt_image.detach()
+                edge_sens = args.bilateral_edge
+
+                # 2. 计算各分量的平滑 Loss
+                # Roughness: 强制区域一致性 (Case 1)
+                loss_bi_rough = bilateral_smoothness_loss(roughness_map, guide_img, lambda_edge=edge_sens)
+                # Metallic: 去除黑白椒盐噪点
+                loss_bi_metal = bilateral_smoothness_loss(metallic_map, guide_img, lambda_edge=edge_sens)
+
+                # 3. 汇总求和
+                total_smooth_loss = loss_bi_rough + loss_bi_metal
+                loss += total_smooth_loss * args.lambda_bilateral
 
             #### envmap
             # TV smoothness
@@ -1440,9 +1463,10 @@ if __name__ == "__main__":
     # 【新增】双边平滑 Loss 的权重 (建议默认 0.1 - 1.0)
     parser.add_argument("--lambda_bilateral", default=0.1, type=float, help="Weight for bilateral smoothness loss.")
     # 【新增】边缘敏感度 (建议默认 10.0)
-    parser.add_argument("--bilateral_edge_decay", default=10.0, type=float,
+    parser.add_argument("--bilateral_edge", default=10.0, type=float,
                         help="Edge sensitivity for bilateral loss. Higher keeps edges sharper.")
-
+    # 【新增】HSV Loss
+    parser.add_argument("--lambda_hsv", default=0.0, type=float, help="Weight for HSV decoupling loss.")
 
     args = parser.parse_args(sys.argv[1:])
     args.test_iterations.append(args.iterations)
