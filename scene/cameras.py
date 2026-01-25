@@ -132,27 +132,37 @@ class Camera(nn.Module):
             mono_depth = Image.open(depth_mono_path)
             mono_depth = torch.from_numpy(np.array(mono_depth)).float().to(self.data_device)
 
-            # 2. 归一化 (关键！必须和你的脚本保持一致)
-            # 脚本里写的是: invmonodepthmap.astype(np.float32) / (2**16)
-            # 假设输入的是 Disparity (Inverse Depth)
-            mono_disp = mono_depth / 65535.0
+            # # 2. 归一化 (关键！必须和你的脚本保持一致)
+            # # 脚本里写的是: invmonodepthmap.astype(np.float32) / (2**16)
+            # # 假设输入的是 Disparity (Inverse Depth)
+            # mono_disp = mono_depth / 65535.0
+            #
+            # # 3. Resize (如果 RGB 和 深度图 尺寸不一致)
+            # if mono_disp.shape[0] != self.image_height or mono_disp.shape[1] != self.image_width:
+            #     mono_disp = \
+            #     F.interpolate(mono_disp[None, None, ...], size=(self.image_height, self.image_width), mode='bilinear',
+            #                   align_corners=False)[0, 0]
+            #
+            # # 4. 应用预计算的 Scale 和 Shift
+            # # 公式: Aligned_Disp = Scale * Mono_Disp + Shift
+            # # 注意：这里的 scale/shift 已经是针对 dataset_readers 里读取的 float 值了
+            # aligned_disp = mono_disp #* depth_scale + depth_shift
+            #
+            # # 5. 转换为 Metric Depth (用于后续训练监督)
+            # aligned_disp = torch.clamp(aligned_disp, min=1e-7)
+            #
+            # # 最终存储的是真实的深度值 (Metric Depth)
+            # self.mono_depth_image = 1.0 / aligned_disp
 
-            # 3. Resize (如果 RGB 和 深度图 尺寸不一致)
-            if mono_disp.shape[0] != self.image_height or mono_disp.shape[1] != self.image_width:
-                mono_disp = \
-                F.interpolate(mono_disp[None, None, ...], size=(self.image_height, self.image_width), mode='bilinear',
-                              align_corners=False)[0, 0]
-
-            # 4. 应用预计算的 Scale 和 Shift
-            # 公式: Aligned_Disp = Scale * Mono_Disp + Shift
-            # 注意：这里的 scale/shift 已经是针对 dataset_readers 里读取的 float 值了
-            aligned_disp = mono_disp * depth_scale + depth_shift
-
-            # 5. 转换为 Metric Depth (用于后续训练监督)
-            aligned_disp = torch.clamp(aligned_disp, min=1e-7)
-
-            # 最终存储的是真实的深度值 (Metric Depth)
-            self.mono_depth_image = 1.0 / aligned_disp
+            # 如果是RGBA或3通道，取第一通道
+            if len(mono_depth.shape) == 3:
+                mono_depth = mono_depth[:, :, 0]
+                # Resize 到和 RGB 图像一样大 (如果需要)
+            if mono_depth.shape[0] != self.image_height or mono_depth.shape[1] != self.image_width:
+                mono_depth = \
+                    F.interpolate(mono_depth[None, None, ...], size=(self.image_height, self.image_width),
+                                  mode='bilinear',align_corners=False)[0, 0]
+            self.mono_depth_image = mono_depth.to(data_device)
         else:
             self.mono_depth_image = None
 

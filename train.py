@@ -37,39 +37,50 @@ try:
 except ImportError:
     TENSORBOARD_FOUND = False
 
-#ljx:深度图尺度对齐
-def align_depth_robust(mono_depth, render_depth, mask):
+
+def align_depth_robust(mono_disp, render_depth, mask):
     """
-    基于逆深度（视差）的鲁棒对齐 (Median / MAD)
-    参考用户提供的 scale estimation 脚本
+    输入:
+    mono_disp: 单目先验 (Depth Anything 输出, 本质是视差, 近大远小)
+    render_depth: 3DGS 渲染深度 (物理深度, 近小远大)
+    mask: 有效区域 [1, H, W]
+
+    输出:
+    aligned_mono_disp: 对齐到 3DGS 尺度的单目视差
     """
-    # 1. 转换为视差 (Disparity = 1 / Depth)
-    # 加上 eps 防止除零
+    # 1. 维度防御 (确保都是 [1, H, W])
+    if render_depth.ndim == 2: render_depth = render_depth.unsqueeze(0)
+    if mono_disp.ndim == 2: mono_disp = mono_disp.unsqueeze(0)
+    if mask.ndim == 2: mask = mask.unsqueeze(0)
+
+    # 2. 数据准备：统一转到【视差空间】
     eps = 1e-6
-    # 假设 mono_depth 和 render_depth 都是线性深度 (Linear Depth)
-    disp_mono = 1.0 / (mono_depth + eps)
+
+    # Depth Anything 输出本身就是视差，不需要取倒数 (除非你之前手动取过倒数，否则直接用)
+    # 假设输入是 [0, 1] 范围的视差
+    disp_mono = mono_disp
+
+    # 3DGS 渲染的是物理深度，必须取倒数变成视差
     disp_render = 1.0 / (render_depth + eps)
 
-    # 2. 筛选有效区域 (Mask)
-    # 确保深度值为正且有限
-    valid_mask = mask & (mono_depth > eps) & (render_depth > eps) & \
+    # 3. 筛选有效点计算 Scale/Offset
+    valid_mask = mask & (disp_mono > eps) & (render_depth > eps) & \
                  torch.isfinite(disp_mono) & torch.isfinite(disp_render)
 
     if valid_mask.sum() < 10:
-        return mono_depth  # 样本过少，不处理
+        return disp_mono, 1.0, 0.0
 
     dm_masked = disp_mono[valid_mask]
     dr_masked = disp_render[valid_mask]
 
-    # 3. 计算统计量 (Median & Mean Absolute Deviation)
+    # 4. 计算统计量 (Median & MAD)
     t_mono = torch.median(dm_masked)
     s_mono = torch.mean(torch.abs(dm_masked - t_mono))
-
     t_render = torch.median(dr_masked)
     s_render = torch.mean(torch.abs(dr_masked - t_render))
 
-    # 4. 计算 Scale 和 Offset
-    # 目标: disp_render approx scale * disp_mono + offset
+    # 5. 计算对齐参数
+    # 目标: aligned_mono ≈ disp_render
     if s_mono < 1e-7:
         scale = 1.0
         offset = 0.0
@@ -77,15 +88,63 @@ def align_depth_robust(mono_depth, render_depth, mask):
         scale = s_render / s_mono
         offset = t_render - scale * t_mono
 
-    # 5. 应用对齐 (在视差空间)
-    aligned_disp = scale * disp_mono + offset
+    # 6. 应用对齐
+    aligned_mono_disp = scale * disp_mono + offset
 
-    # 6. 转回深度空间
-    # 处理负视差或极小值 (对应无限远或错误点)，截断到非常远但有限的深度
-    aligned_disp = torch.clamp(aligned_disp, min=eps)
-    aligned_mono_depth = 1.0 / aligned_disp
+    # 截断负值，视差不能为负
+    aligned_mono_disp = torch.clamp(aligned_mono_disp, min=eps)
 
-    return aligned_mono_depth,scale,offset
+    return aligned_mono_disp, scale, offset
+
+# #ljx:深度图尺度对齐
+# def align_depth_robust(mono_depth, render_depth, mask):
+#     """
+#     基于逆深度（视差）的鲁棒对齐 (Median / MAD)
+#     参考用户提供的 scale estimation 脚本
+#     """
+#     # 1. 转换为视差 (Disparity = 1 / Depth)
+#     # 加上 eps 防止除零
+#     eps = 1e-6
+#     # 假设 mono_depth 和 render_depth 都是线性深度 (Linear Depth)
+#     disp_mono = 1.0 / (mono_depth + eps)
+#     disp_render = 1.0 / (render_depth + eps)
+#
+#     # 2. 筛选有效区域 (Mask)
+#     # 确保深度值为正且有限
+#     valid_mask = mask & (mono_depth > eps) & (render_depth > eps) & \
+#                  torch.isfinite(disp_mono) & torch.isfinite(disp_render)
+#
+#     if valid_mask.sum() < 10:
+#         return mono_depth  # 样本过少，不处理
+#
+#     dm_masked = disp_mono[valid_mask]
+#     dr_masked = disp_render[valid_mask]
+#
+#     # 3. 计算统计量 (Median & Mean Absolute Deviation)
+#     t_mono = torch.median(dm_masked)
+#     s_mono = torch.mean(torch.abs(dm_masked - t_mono))
+#
+#     t_render = torch.median(dr_masked)
+#     s_render = torch.mean(torch.abs(dr_masked - t_render))
+#
+#     # 4. 计算 Scale 和 Offset
+#     # 目标: disp_render approx scale * disp_mono + offset
+#     if s_mono < 1e-7:
+#         scale = 1.0
+#         offset = 0.0
+#     else:
+#         scale = s_render / s_mono
+#         offset = t_render - scale * t_mono
+#
+#     # 5. 应用对齐 (在视差空间)
+#     aligned_disp = scale * disp_mono + offset
+#
+#     # 6. 转回深度空间
+#     # 处理负视差或极小值 (对应无限远或错误点)，截断到非常远但有限的深度
+#     aligned_disp = torch.clamp(aligned_disp, min=eps)
+#     aligned_mono_depth = 1.0 / aligned_disp
+#
+#     return aligned_mono_depth,scale,offset
 
 
 def pearson_correlation_loss(pred, target, mask=None):
@@ -537,32 +596,32 @@ def training(
 
                     # C. [新增] 剔除 RGB 图像中的纯黑/纯白区域 (Intensity Check)
                     # 在过曝(纯白)或欠曝(纯黑)区域，单目深度模型通常是"瞎猜"的
-                    if hasattr(viewpoint_cam, 'original_image'):
-                        # 获取原始 RGB 图像 [3, H, W]，归一化到 [0, 1]
-                        gt_image = viewpoint_cam.original_image.cuda()
-
-                        # 计算亮度 (灰度值)
-                        # Y = 0.299*R + 0.587*G + 0.114*B (简单平均也可以)
-                        intensity = gt_image.mean(dim=0, keepdim=True)  # [1, H, W]
-
-                        # 设定阈值：剔除亮度 < 0.05 (极黑) 和 > 0.95 (极白) 的像素
-                        # 注意：如果你的场景里有纯白物体（如白墙），这个阈值要设宽一点，比如 > 0.98
-                        valid_rgb_mask = (intensity > 0.05) & (intensity < 0.98)
-
-                        valid_mask &= valid_rgb_mask
+                    # if hasattr(viewpoint_cam, 'original_image'):
+                    #     # 获取原始 RGB 图像 [3, H, W]，归一化到 [0, 1]
+                    #     gt_image = viewpoint_cam.original_image.cuda()
+                    #
+                    #     # 计算亮度 (灰度值)
+                    #     # Y = 0.299*R + 0.587*G + 0.114*B (简单平均也可以)
+                    #     intensity = gt_image.mean(dim=0, keepdim=True)  # [1, H, W]
+                    #
+                    #     # 设定阈值：剔除亮度 < 0.05 (极黑) 和 > 0.95 (极白) 的像素
+                    #     # 注意：如果你的场景里有纯白物体（如白墙），这个阈值要设宽一点，比如 > 0.98
+                    #     valid_rgb_mask = (intensity > 0.05) & (intensity < 0.98)
+                    #
+                    #     valid_mask &= valid_rgb_mask
 
                     depth_loss_type = getattr(opt, "depth_loss_type", "complex")
 
                     if valid_mask.sum() > 100:  # 稍微提高阈值
-                        aligned_mono_depth = mono_depth
+                        aligned_mono_depth, scale, offset = align_depth_robust(mono_depth,render_depth.detach(),valid_mask)
+                        render_depth = 1.0 / (render_depth + 1e-6) #从深度转换成视差，render_depth是视差
+                        #aligned_mono_depth = mono_depth
                         # ================= [改进点 1] 边缘感知权重 =================
                         # 计算单目深度的梯度幅度
                         dy, dx = depth_gradient(aligned_mono_depth)
                         grad_mag = torch.sqrt(dy ** 2 + dx ** 2)
-
                         # 归一化梯度到 0-1
                         grad_norm = (grad_mag - grad_mag.min()) / (grad_mag.max() - grad_mag.min() + 1e-8)
-
                         # 生成权重：梯度越大（边缘），权重越小
                         # 这里的 5.0 是敏感度参数，可调。exp(-5x) 会让强边缘处的权重接近 0
                         edge_weight = torch.exp(-5.0 * grad_norm)
@@ -689,7 +748,7 @@ def training(
                     # if iteration % 1000 == 0:
                     #     print(f"Normal Consistency Kept: {Mn.sum()/gt_alpha_mask.sum():.2%}")
 
-            # ==================== 深度对比 Debug====================
+            # ==================== 深度对比 Debug(loss用的视差，debug用的深度)====================
             if use_mono_depth and iteration % 100 == 0:
                 debug_dir = os.path.join(args.model_path, "debug_depths")
                 os.makedirs(debug_dir, exist_ok=True)
@@ -701,6 +760,7 @@ def training(
                 target_depth = None
                 if hasattr(viewpoint_cam, 'mono_depth_image'):
                     target_depth = viewpoint_cam.mono_depth_image
+                    target_depth = 1.0 / (target_depth + 1e-6) #从深度转换成视差，render_depth是视差
 
                 if target_depth is not None:
                     # ---------------------------------------------------------
