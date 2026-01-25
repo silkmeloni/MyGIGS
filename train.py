@@ -365,16 +365,6 @@ def training(
     progress_bar = trange(first_iter, opt.iterations, desc="Training progress")  # For logging
     use_mono_depth = getattr(dataset, "use_mono_depth", False)
 
-    # # === 【新增 1】 初始化早停标志位 ===
-    # depth_sup_stopped = False  # 用来记录是否已经打印过停止信息
-    # # === 【新增】基于 Loss 趋势的动态早停变量 ===
-    # depth_sup_enabled = True  # 开关
-    # mono_loss_ema = None  # Loss 的平滑值
-    # best_mono_loss = float('inf')  # 记录历史最低 Loss
-    # patience = 1000  # 耐心值：允许 Loss 多久不下降
-    # patience_counter = 0  # 计数器
-    # min_depth_iter = 3000  # 最小迭代次数 (防止还没开始就停了)
-
     print("Start training...单目深度权重为",getattr(opt, "lambda_mono", 0.1) , "单目法线权重为",getattr(opt, "lambda_mono_normal", 0.1))
     print("深度先验：",getattr(dataset, "use_mono_depth", False),"法线先验：",getattr(dataset, "use_mono_normal", False))
 
@@ -447,6 +437,7 @@ def training(
         roughness_map = rendering_result["roughness_map"]  # [1, H, W]
         metallic_map = rendering_result["metallic_map"]  # [1, H, W]
         # allmap = rendering_result["allmap"]
+        #specular_map = rendering_result["metallic_map"]
 
         # formulate roughness
         rmax, rmin = 1.0, 0.04
@@ -472,7 +463,6 @@ def training(
         normal_loss = 0.0
         loss_mono_depth = 0.0
         loss_omnidata = 0.0
-        lambda_mono = getattr(opt, "lambda_mono", 0.1)
         use_mono_normal = getattr(dataset, "use_mono_normal", False)
         lambda_mono_normal = getattr(args, "lambda_mono_normal", 0.05)  # 注意这里 args 的作用域
 
@@ -490,6 +480,7 @@ def training(
 
         #cur_lambda_depth = 1.0
         #cur_lambda_normal = 1.0
+
 
         if iteration <= pbr_iteration:
 
@@ -538,6 +529,27 @@ def training(
 
                     # 4. 生成 Valid Mask (所有参与运算的 Tensor 必须都是 [1, H, W])
                     valid_mask = (mono_depth > 1e-4) & render_mask & (gt_alpha_mask > 0.5)
+
+                    # B. [新增] 剔除深度图的极端值 (Clipping Artifacts)
+                    # 单目深度通常归一化到 [0, 1]。0.0 和 1.0 往往是模型预测的截断值（太远或太近），不可信。
+                    # 剔除极小值 (天空/无限远) 和 极大值 (贴脸/截断)
+                    #valid_mask &= (mono_depth < 0.99) & (mono_depth > 0.01)
+
+                    # C. [新增] 剔除 RGB 图像中的纯黑/纯白区域 (Intensity Check)
+                    # 在过曝(纯白)或欠曝(纯黑)区域，单目深度模型通常是"瞎猜"的
+                    if hasattr(viewpoint_cam, 'original_image'):
+                        # 获取原始 RGB 图像 [3, H, W]，归一化到 [0, 1]
+                        gt_image = viewpoint_cam.original_image.cuda()
+
+                        # 计算亮度 (灰度值)
+                        # Y = 0.299*R + 0.587*G + 0.114*B (简单平均也可以)
+                        intensity = gt_image.mean(dim=0, keepdim=True)  # [1, H, W]
+
+                        # 设定阈值：剔除亮度 < 0.05 (极黑) 和 > 0.95 (极白) 的像素
+                        # 注意：如果你的场景里有纯白物体（如白墙），这个阈值要设宽一点，比如 > 0.98
+                        valid_rgb_mask = (intensity > 0.05) & (intensity < 0.98)
+
+                        valid_mask &= valid_rgb_mask
 
                     depth_loss_type = getattr(opt, "depth_loss_type", "complex")
 
@@ -868,6 +880,25 @@ def training(
                 render_direct,
                 background[:, None, None],
             )
+
+            specular_map = pbr_result["specular_rgb"].permute(2, 0, 1)
+
+            # =========================================================
+            # [Feature] 自监督高光掩膜 (Self-Supervised Specular Masking)
+            # =========================================================
+            # 只有在开启参数且 albedo 是可导变量时才执行
+            if args.use_specular_mask:  # 建议加个 warmup，前期别开
+                # A. 计算高光强度 (取 RGB 亮度的最大值)
+                spec_intensity = specular_map.detach().max(dim=0, keepdim=True)[0]  # [1, H, W]
+                # B. 制作梯度权重 (Gradient Weight)
+                grad_scale = torch.exp(-5.0 * spec_intensity.clamp(0, 1))
+                # C. 注册 Hook (梯度拦截器)
+                def hook_fn(grad):
+                    return grad * grad_scale
+
+                # 注册 Hook
+                albedo_map.register_hook(hook_fn)
+            # =========================================================
 
             SSR = Gaussian_SSR(tanfovx, tanfovy, image_width, image_height, radius, bias, thick, delta, step, start)
             if metallic:
@@ -1467,6 +1498,9 @@ if __name__ == "__main__":
                         help="Edge sensitivity for bilateral loss. Higher keeps edges sharper.")
     # 【新增】HSV Loss
     parser.add_argument("--lambda_hsv", default=0.0, type=float, help="Weight for HSV decoupling loss.")
+    # 【新增】高光自适应掩码
+    parser.add_argument("--use_specular_mask", action="store_true",
+                        help="Enable self-supervised specular masking to prevent albedo baking.")
 
     args = parser.parse_args(sys.argv[1:])
     args.test_iterations.append(args.iterations)
