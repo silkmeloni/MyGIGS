@@ -100,8 +100,8 @@ class OptimizationParams(ParamGroup):
         self.densify_grad_threshold = 0.0002
         self.random_background = False
 
-        self.lambda_mono = 0.0  # 这里的默认值通常给 0，表示默认关闭
-        self.lambda_mono_normal = 0.0  # 这里的默认值通常给 0，表示默认关闭
+        self.lambda_mono = 0.1  # 这里的默认值通常给 0，表示默认关闭
+        self.lambda_mono_normal = 0.1  # 这里的默认值通常给 0，表示默认关闭
 
         self.depth_loss_type = 'complex'
 

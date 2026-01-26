@@ -41,6 +41,39 @@ except ImportError:
     TENSORBOARD_FOUND = False
 
 
+def align_disparity_simple(disp_source, disp_target, mask):
+    """
+    输入两个都是视差图 (近大远小)，计算 scale/offset 使 source 拟合 target
+    """
+    # 筛选有效点
+    source_masked = disp_source[mask]
+    target_masked = disp_target[mask]
+
+    # 计算中位数
+    t_source = torch.median(source_masked)
+    t_target = torch.median(target_masked)
+
+    # 计算平均绝对偏差 (MAD)
+    s_source = torch.mean(torch.abs(source_masked - t_source))
+    s_target = torch.mean(torch.abs(target_masked - t_target))
+
+    # 计算参数
+    eps = 1e-8
+    if s_source < eps:
+        scale = 1.0
+        offset = 0.0
+    else:
+        scale = s_target / s_source
+        offset = t_target - scale * t_source
+
+    # 应用对齐
+    aligned_source = scale * disp_source + offset
+
+    # 截断负值 (视差必须 >= 0)
+    aligned_source = torch.clamp(aligned_source, min=0.0)
+
+    return aligned_source, scale, offset
+
 def align_depth_robust(mono_disp, render_depth, mask):
     """
     输入:
@@ -526,9 +559,9 @@ def training(
         loss_mono_depth = 0.0
         loss_omnidata = 0.0
         use_mono_normal = getattr(dataset, "use_mono_normal", False)
-        lambda_mono_normal = getattr(args, "lambda_mono_normal", 0.05)  # 注意这里 args 的作用域
+        #lambda_mono_normal = getattr(args, "lambda_mono_normal", 0.05)  # 注意这里 args 的作用域
         aligned_mono_depth = None
-        render_depth = None
+        #render_depth = None
 
 
         # --- 计算当前权重 ---
@@ -620,7 +653,8 @@ def training(
 
                     if valid_mask.sum() > 100:  # 稍微提高阈值
                         render_depth = 1.0 / (render_depth + 1e-6)  # 从深度转换成视差，render_depth是视差
-                        aligned_mono_depth, scale, offset = align_depth_robust(mono_depth,render_depth.detach(),valid_mask)
+                        #aligned_mono_depth, scale, offset = align_depth_robust(mono_depth,render_depth.detach(),valid_mask)
+                        aligned_mono_depth, scale, offset = align_disparity_simple(mono_depth,render_depth.detach(),valid_mask)
                         #aligned_mono_depth = mono_depth
                         # ================= [改进点 1] 边缘感知权重 =================
                         # 计算单目深度的梯度幅度
@@ -760,7 +794,8 @@ def training(
                 os.makedirs(debug_dir, exist_ok=True)
 
                 # 1. 获取预测深度 (Rendered Depth) 是深度不是视差，还没处理过
-                pred_depth = render_depth.detach()#rendering_result["depth_map"].detach()
+                render_depth = rendering_result["depth_map"].detach()
+                pred_depth = 1.0 / (render_depth + 1e-6)
 
                 # 2. 获取单目深度 (Target Depth)
                 target_depth = aligned_mono_depth.detach()
