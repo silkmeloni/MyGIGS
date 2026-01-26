@@ -456,12 +456,12 @@ def training(
 
     # define progress bar
     viewpoint_stack = None
-    ema_loss_for_log = 0.0
     progress_bar = trange(first_iter, opt.iterations, desc="Training progress")  # For logging
     use_mono_depth = getattr(dataset, "use_mono_depth", False)
+    use_mono_normal = getattr(dataset, "use_mono_normal", False)
 
     print("Start training...单目深度权重为",getattr(opt, "lambda_mono", 0.1) , "单目法线权重为",getattr(opt, "lambda_mono_normal", 0.1))
-    print("深度先验：",getattr(dataset, "use_mono_depth", False),"法线先验：",getattr(dataset, "use_mono_normal", False))
+    print("深度先验：",use_mono_depth,"法线先验：",use_mono_normal)
 
     # --- 配置参数 (可以提取到 args 里) ---
     # 深度先验调度
@@ -552,16 +552,15 @@ def training(
 
         gt_image = viewpoint_cam.original_image[0:3, :, :].cuda()
         gt_image = (gt_image * alpha_mask + background[:, None, None] * (1.0 - alpha_mask)).clamp(0.0, 1.0)
-        
+
         loss: torch.Tensor
         Ll1 = F.l1_loss(image, gt_image)
         normal_loss = 0.0
         loss_mono_depth = 0.0
         loss_omnidata = 0.0
-        use_mono_normal = getattr(dataset, "use_mono_normal", False)
-        #lambda_mono_normal = getattr(args, "lambda_mono_normal", 0.05)  # 注意这里 args 的作用域
+
         aligned_mono_depth = None
-        #render_depth = None
+
 
 
         # --- 计算当前权重 ---
@@ -576,15 +575,11 @@ def training(
             args.lambda_mono_normal, normal_min_ratio
         )
 
-        #cur_lambda_depth = 1.0
-        #cur_lambda_normal = 1.0
-
-
         if iteration <= pbr_iteration:
-
+            # --- 基础 RGB & Normal Loss ---
             mask = rendering_result["normal_from_depth_mask"]
-            # 原有的rgb_loss
             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+
             # === 原有的normal_loss保持不变 ===
             normal_loss_weight = 1.0
             normal_loss = F.l1_loss(normal_map[:, mask], normal_map_from_depth[:, mask])
@@ -592,142 +587,204 @@ def training(
             normal_tv_loss = get_tv_loss(gt_image, normal_map, pad=1, step=1)
             loss += normal_tv_loss * normal_tv_weight
 
-            # 打印日志 (可选)
             if iteration % 1000 == 0:
                 print(f"[Scheduler] Iter {iteration}: Depth W={cur_lambda_depth:.4f}, Normal W={cur_lambda_normal:.4f}")
-            # >>>>> 新增/修改: Depth Anything 深度与法线监督 <<<<<
 
-            # 1. 设置预热步数 (Warm-up)，前 1000 步不加约束，防止 Scale 计算错误
-            loss_mono_depth_val = 0.0  # 用于日志
-            if use_mono_depth: #and iteration > 1000:
-                if hasattr(viewpoint_cam, 'mono_depth_image') and viewpoint_cam.mono_depth_image is not None:
-                    # 1. 获取单目深度，确保它是 [1, H, W]
-                    mono_depth = viewpoint_cam.mono_depth_image
-                    if mono_depth.ndim == 3:
-                        if mono_depth.shape[2] == 3:  # [H, W, 3] -> [1, H, W]
-                            mono_depth = mono_depth[..., 0:1].permute(2, 0, 1)
-                        elif mono_depth.shape[0] == 3:  # [3, H, W] -> [1, H, W]
-                            mono_depth = mono_depth[0:1, ...]
-                    elif mono_depth.ndim == 2:  # [H, W] -> [1, H, W]
-                        mono_depth = mono_depth.unsqueeze(0)
+            # >>>>> 深度监督模块 (Depth Anything) <<<<<
+            # 前 1000 步 Warm-up 跳过，防止几何不稳定导致 Scale 计算错误
+            if use_mono_depth and hasattr(viewpoint_cam, 'mono_depth_image'):
 
-                    # 2. 获取渲染深度，确保它是 [1, H, W]
-                    render_depth = rendering_result["depth_map"]
+                # 1. 数据准备 & 维度标准化 [1, H, W]
+                # -----------------------------------------------------------
+                mono_disp = viewpoint_cam.mono_depth_image  # 原始输入本质是视差
+                if mono_disp.ndim == 2:
+                    mono_disp = mono_disp.unsqueeze(0)
+                elif mono_disp.shape[0] == 3:
+                    mono_disp = mono_disp[0:1, ...]
+                elif mono_disp.shape[2] == 3:
+                    mono_disp = mono_disp[..., 0:1].permute(2, 0, 1)
 
-                    # 3. 准备 Masks，确保它们都是 [1, H, W]
-                    gt_alpha_mask = viewpoint_cam.gt_alpha_mask.cuda()
-                    if gt_alpha_mask.ndim == 2:
-                        gt_alpha_mask = gt_alpha_mask.unsqueeze(0)
+                render_depth = rendering_result["depth_map"]  # 物理深度 (近小远大)
+                render_disp = 1.0 / (render_depth + 1e-6)  # 转换为视差 (近大远小) 用于对齐和Loss
 
-                    # rendering_result["normal_from_depth_mask"] 通常已经是 [1, H, W]
-                    # 如果不确定，可以保险地写成:
-                    render_mask = mask
-                    if render_mask.ndim == 2:
-                        render_mask = render_mask.unsqueeze(0)
+                # 2. 生成 Valid Mask
+                # -----------------------------------------------------------
+                # A. 基础几何 Mask
+                gt_alpha = viewpoint_cam.gt_alpha_mask.cuda()
+                if gt_alpha.ndim == 2: gt_alpha = gt_alpha.unsqueeze(0)
+                render_mask = mask if mask.ndim == 3 else mask.unsqueeze(0)
 
-                    # 4. 生成 Valid Mask (所有参与运算的 Tensor 必须都是 [1, H, W])
-                    valid_mask = (mono_depth > 1e-4) & render_mask & (gt_alpha_mask > 0.5)
+                valid_mask = (mono_disp > 1e-4) & render_mask & (gt_alpha > 0.5)
 
-                    # B. [新增] 剔除深度图的极端值 (Clipping Artifacts)
-                    # 单目深度通常归一化到 [0, 1]。0.0 和 1.0 往往是模型预测的截断值（太远或太近），不可信。
-                    # 剔除极小值 (天空/无限远) 和 极大值 (贴脸/截断)
-                    #valid_mask &= (mono_depth < 0.99) & (mono_depth > 0.01)
+                # B. RGB 亮度剔除 (去除过曝/欠曝区域的错误估计)
+                if hasattr(viewpoint_cam, 'original_image'):
+                    gt_image_raw = viewpoint_cam.original_image.cuda()
+                    intensity = gt_image_raw.mean(dim=0, keepdim=True)
+                    valid_mask &= (intensity > 0.02) & (intensity < 0.99)
 
-                    # C. [新增] 剔除 RGB 图像中的纯黑/纯白区域 (Intensity Check)
-                    # 在过曝(纯白)或欠曝(纯黑)区域，单目深度模型通常是"瞎猜"的
-                    if hasattr(viewpoint_cam, 'original_image'):
-                        # 获取原始 RGB 图像 [3, H, W]，归一化到 [0, 1]
-                        gt_image = viewpoint_cam.original_image.cuda()
+                # 3. 对齐与 Loss 计算
+                # -----------------------------------------------------------
+                if valid_mask.sum() > 100:
+                    # A. 视差对齐 (在视差空间进行线性回归)
+                    # aligned_mono_depth 在这里实际上是 aligned_mono_disp
+                    aligned_mono_disp, scale, offset = align_disparity_simple(
+                        mono_disp, render_disp.detach(), valid_mask
+                    )
+                    # 赋值给外部变量用于可能的 Debug 可视化
+                    aligned_mono_depth = aligned_mono_disp
 
-                        # 计算亮度 (灰度值)
-                        # Y = 0.299*R + 0.587*G + 0.114*B (简单平均也可以)
-                        intensity = gt_image.mean(dim=0, keepdim=True)  # [1, H, W]
+                    # B. 计算边缘感知权重 (降低边缘处的 Loss 权重)
+                    dy, dx = depth_gradient(aligned_mono_disp)
+                    grad_mag = torch.sqrt(dy ** 2 + dx ** 2)
+                    grad_norm = (grad_mag - grad_mag.min()) / (grad_mag.max() - grad_mag.min() + 1e-8)
+                    edge_weight = torch.exp(-5.0 * grad_norm)
 
-                        # 设定阈值：剔除亮度 < 0.05 (极黑) 和 > 0.95 (极白) 的像素
-                        # 注意：如果你的场景里有纯白物体（如白墙），这个阈值要设宽一点，比如 > 0.98
-                        valid_rgb_mask = (intensity > 0.02) & (intensity < 0.99)
-
-                        valid_mask &= valid_rgb_mask
-
+                    # C. 计算深度 Loss
                     depth_loss_type = getattr(opt, "depth_loss_type", "complex")
 
-                    if valid_mask.sum() > 100:  # 稍微提高阈值
-                        render_depth = 1.0 / (render_depth + 1e-6)  # 从深度转换成视差，render_depth是视差
-                        #aligned_mono_depth, scale, offset = align_depth_robust(mono_depth,render_depth.detach(),valid_mask)
-                        aligned_mono_depth, scale, offset = align_disparity_simple(mono_depth,render_depth.detach(),valid_mask)
-                        #aligned_mono_depth = mono_depth
-                        # ================= [改进点 1] 边缘感知权重 =================
-                        # 计算单目深度的梯度幅度
-                        dy, dx = depth_gradient(aligned_mono_depth)
-                        grad_mag = torch.sqrt(dy ** 2 + dx ** 2)
-                        # 归一化梯度到 0-1
-                        grad_norm = (grad_mag - grad_mag.min()) / (grad_mag.max() - grad_mag.min() + 1e-8)
-                        # 生成权重：梯度越大（边缘），权重越小
-                        # 这里的 5.0 是敏感度参数，可调。exp(-5x) 会让强边缘处的权重接近 0
-                        edge_weight = torch.exp(-5.0 * grad_norm)
+                    if depth_loss_type == 'l1':
+                        # 简单 L1
+                        diff = torch.abs(render_disp - aligned_mono_disp)
+                        loss_depth_final = (diff * edge_weight)[valid_mask].mean()
+                    else:
+                        # 组合 Loss: Log L1 + Pearson + Gradient
+                        # (1) Log L1 Loss
+                        diff_map = torch.abs(render_disp - aligned_mono_disp)
+                        log_loss = (torch.log(1.0 + diff_map) * edge_weight)[valid_mask].mean()
 
-                        if depth_loss_type == 'l1':
-                            # 直接计算绝对误差
-                            loss_mono_depth = torch.abs(
-                                render_depth[valid_mask] - aligned_mono_depth[valid_mask]).mean()
+                        # (2) Pearson Correlation Loss (结构一致性)
+                        pred_v = render_disp[valid_mask]
+                        target_v = aligned_mono_disp[valid_mask]
+                        pred_v = pred_v - pred_v.mean()
+                        target_v = target_v - target_v.mean()
+                        # 余弦相似度
+                        loss_pearson = 1.0 - (
+                                (pred_v * target_v).sum() /
+                                (torch.sqrt((pred_v ** 2).sum() * (target_v ** 2).sum()) + 1e-8)
+                        )
+
+                        # (3) Gradient Loss (仅后期启用，增强细节)
+                        loss_grad = 0.0
+                        if iteration > 3000:
+                            g_render_y, g_render_x = depth_gradient(render_disp)
+                            g_mono_y, g_mono_x = depth_gradient(aligned_mono_disp)
+                            g_diff = torch.abs(g_render_y - g_mono_y) + torch.abs(g_render_x - g_mono_x)
+                            loss_grad = g_diff[valid_mask].mean()
+
+                        # 组合权重: L1主导，Pearson保结构，Grad保锐度
+                        loss_depth_final = 0.7 * log_loss + 0.3 * loss_pearson + 0.05 * loss_grad
+
+                    # 4. 异常剔除与累加
+                    # -----------------------------------------------------------
+                    loss_mono_depth = loss_depth_final
+
+                    # 帧级异常检测 (阈值可根据 log loss 的量级调整，通常 1.0-2.0)
+                    if loss_mono_depth.item() > 1.5:
+                        if iteration % 100 == 0:
+                            print(f"[Warn] Iter {iteration} Depth Loss {loss_mono_depth.item():.4f} > 1.5. Ignored.")
+                        loss_mono_depth = 0.0
+                    else:
+                        loss += cur_lambda_depth * loss_mono_depth
+
+            # ==================== 深度与视差双重 Debug ====================
+            if use_mono_depth and iteration % 100 == 0:
+                # 1. 创建两个文件夹
+                dir_disp = os.path.join(args.model_path, "debug_disparity")
+                dir_depth = os.path.join(args.model_path, "debug_metric_depth")
+                os.makedirs(dir_disp, exist_ok=True)
+                os.makedirs(dir_depth, exist_ok=True)
+
+                # 2. 数据准备
+                # ---------------------------------------------------------
+                # A. 原始数据获取
+                render_depth_raw = rendering_result["depth_map"].detach()  # [1, H, W] 物理深度
+                aligned_disp_raw = aligned_mono_depth.detach() if aligned_mono_depth is not None else None  # [1, H, W] 视差
+
+                if aligned_disp_raw is not None:
+                    # B. 维度标准化 (统一为 [1, H, W])
+                    if render_depth_raw.ndim == 2: render_depth_raw = render_depth_raw.unsqueeze(0)
+                    if aligned_disp_raw.ndim == 2:
+                        aligned_disp_raw = aligned_disp_raw.unsqueeze(0)
+                    elif aligned_disp_raw.ndim == 3 and aligned_disp_raw.shape[0] == 3:
+                        aligned_disp_raw = aligned_disp_raw[0:1]
+
+                    # C. 尺寸对齐 (以 3DGS 渲染分辨率为准)
+                    if render_depth_raw.shape[-2:] != aligned_disp_raw.shape[-2:]:
+                        aligned_disp_raw = F.interpolate(
+                            aligned_disp_raw.unsqueeze(0),
+                            size=render_depth_raw.shape[-2:],
+                            mode='bilinear', align_corners=False
+                        ).squeeze(0)
+
+                    # ---------------------------------------------------------
+                    # 3. 核心可视化函数 (通用)
+                    # ---------------------------------------------------------
+                    def save_visualization(pred, target, mask, save_path, mode='disp'):
+                        """
+                        mode='disp': 视差模式，关注近处，截断极大值
+                        mode='depth': 深度模式，关注远处，截断极大值(远平面)
+                        """
+                        # 1. 动态计算截断阈值
+                        if mask.sum() > 0:
+                            clip_max = torch.quantile(target[mask], 0.98).item()
+                            min_limit = 1.0 if mode == 'disp' else 10.0
+                            clip_max = max(clip_max, min_limit)
                         else:
-                            # 1. Log L1 (应用边缘降权)
-                            diff_map = torch.abs(render_depth - aligned_mono_depth)
-                            log_diff = torch.log(1.0 + diff_map)
+                            clip_max = 10.0 if mode == 'disp' else 100.0
 
-                            # 只在计算 mean 之前乘权重
-                            # valid_mask 区域内的平均 loss
-                            weighted_log_loss = log_diff * edge_weight
-                            loss_depth_l1 = weighted_log_loss[valid_mask].mean()
+                        def robust_norm(d):
+                            d_clamped = torch.clamp(d, max=clip_max)
+                            valid_d = d_clamped[mask]
+                            if valid_d.numel() > 0:
+                                d_min, d_max = valid_d.min(), valid_d.max()
+                                if (d_max - d_min) > 1e-6:
+                                    return (d_clamped - d_min) / (d_max - d_min)
+                            return torch.zeros_like(d)
 
-                            # 2. [进阶] Pearson Correlation Loss (结构一致性)
-                            # 计算两者的相关性，越接近 1 越好，Loss = 1 - Correlation
-                            pred_val = render_depth[valid_mask]
-                            target_val = aligned_mono_depth[valid_mask]
+                        vis_pred = robust_norm(pred)
+                        vis_target = robust_norm(target)
 
-                            # 减均值
-                            pred_mean = pred_val - pred_val.mean()
-                            target_mean = target_val - target_val.mean()
+                        # 误差图
+                        diff = torch.abs(pred - target)
+                        vis_diff = robust_norm(diff)
 
-                            # 计算协方差与标准差
-                            cov = (pred_mean * target_mean).sum()
-                            pred_std = torch.sqrt((pred_mean ** 2).sum() + 1e-8)
-                            target_std = torch.sqrt((target_mean ** 2).sum() + 1e-8)
+                        # 【修复点在这里】先乘 Mask，再拼接
+                        # 这样每一张小图都单独被 Mask 处理了，背景变黑
+                        vis_pred = vis_pred * mask
+                        vis_target = vis_target * mask
+                        vis_diff = vis_diff * mask
 
-                            loss_depth_pearson = 1.0 - (cov / (pred_std * target_std + 1e-8))
+                        # 拼接: [Pred | Target | Diff] -> [1, H, 3W]
+                        row = torch.cat([vis_pred, vis_target, vis_diff], dim=2)
+                        # 复制成 3 通道 (RGB) 以便保存 -> [3, H, 3W]
+                        row = row.repeat(3, 1, 1)
+                        torchvision.utils.save_image(row, save_path)
 
-                            # 3. [可选] Gradient Loss (边缘锐度)
-                            # 仅在迭代后期 (如 > 3000) 启用，避免初期几何不稳定时造成干扰
-                            loss_depth_grad = 0.0
-                            if iteration > 3000:
-                                grad_render_y, grad_render_x = depth_gradient(render_depth)
-                                grad_mono_y, grad_mono_x = depth_gradient(aligned_mono_depth)
-                                # 只在 mask 区域计算梯度的差异
-                                grad_diff = torch.abs(grad_render_y - grad_mono_y) + torch.abs(grad_render_x - grad_mono_x)
-                                loss_depth_grad = grad_diff[valid_mask].mean()
+                    # ---------------------------------------------------------
+                    # 4. 生成两组可视化
+                    # ---------------------------------------------------------
 
-                            # === 总深度 Loss 组合 ===
-                            # 权重建议：L1 占主导，Pearson 辅助结构，Grad 辅助细节
-                            # 例如: 0.7 * L1 + 0.3 * Pearson + 0.1 * Grad
-                            # 你可以根据实验调整 lambda_mono 的倍率
+                    # === Group 1: 视差对比 (Disparity) ===
+                    # 3DGS 深度转视差
+                    pred_disp = 1.0 / (render_depth_raw + 1e-6)
+                    target_disp = aligned_disp_raw
 
-                            loss_mono_depth = 0.7 * loss_depth_l1 + 0.3 * loss_depth_pearson + 0.05 * loss_depth_grad
+                    save_visualization(
+                        pred_disp, target_disp, valid_mask,
+                        f"{dir_disp}/iter_{iteration:05d}_disp.png",
+                        mode='disp'
+                    )
 
-                        #单帧异常剔除
-                        depth_loss_threshold = 1.5
-                        current_depth_loss_val = loss_mono_depth.item()
-                        if current_depth_loss_val > depth_loss_threshold:
-                            # 只有在偶尔打印日志时才警告，防止刷屏
-                            if iteration % 100 == 0:
-                                print(
-                                    f"[Warning Iter {iteration}] Depth Loss ({current_depth_loss_val:.4f}) > {depth_loss_threshold}. Ignoring depth prior for this frame.")
+                    # === Group 2: 深度对比 (Metric Depth) ===
+                    # 单目视差转深度
+                    pred_depth = render_depth_raw
+                    target_depth = 1.0 / (aligned_disp_raw + 1e-6)
 
-                            # 【核心】直接归零，不加到总 loss 里
-                            loss_mono_depth = 0.0
-                        else:
-                            # 正常情况：应用权重并累加
-                            loss += cur_lambda_depth * loss_mono_depth
-            # # >>>>> 结束新增 <<<<<
+                    save_visualization(
+                        pred_depth, target_depth, valid_mask,
+                        f"{dir_depth}/iter_{iteration:05d}_depth.png",
+                        mode='depth'
+                    )
 
             # [新增] 单目法线监督
             # ================= [Mn: 基于法线一致性的 Mask] =================
@@ -788,87 +845,7 @@ def training(
                     # if iteration % 1000 == 0:
                     #     print(f"Normal Consistency Kept: {Mn.sum()/gt_alpha_mask.sum():.2%}")
 
-            # ==================== 深度对比 Debug(loss用的视差，debug用的深度)====================
-            if use_mono_depth and iteration % 100 == 0:
-                debug_dir = os.path.join(args.model_path, "debug_depths")
-                os.makedirs(debug_dir, exist_ok=True)
 
-                # 1. 获取预测深度 (Rendered Depth) 是深度不是视差，还没处理过
-                render_depth = rendering_result["depth_map"].detach()
-                pred_depth = 1.0 / (render_depth + 1e-6)
-
-                # 2. 获取单目深度 (Target Depth)
-                target_depth = aligned_mono_depth.detach()
-                # target_depth = None
-                # if hasattr(viewpoint_cam, 'mono_depth_image'):
-                #     target_depth = viewpoint_cam.mono_depth_image
-                #     #target_depth = 1.0 / (target_depth + 1e-6) #从深度转换成视差，render_depth是视差
-
-                if target_depth is not None:
-                    # ---------------------------------------------------------
-                    # [修复] 健壮的维度标准化: 统统转为 [1, H, W]
-                    # ---------------------------------------------------------
-                    if target_depth.ndim == 2:
-                        target_depth = target_depth.unsqueeze(0)
-                    elif target_depth.ndim == 3:
-                        if target_depth.shape[2] == 1:
-                            target_depth = target_depth.permute(2, 0, 1)
-                        elif target_depth.shape[2] == 3:
-                            target_depth = target_depth[..., 0].unsqueeze(0)
-                        elif target_depth.shape[0] == 3:
-                            target_depth = target_depth[0, ...].unsqueeze(0)
-                        pass
-
-                    # ---------------------------------------------------------
-                    # 尺寸对齐 (插值)
-                    # ---------------------------------------------------------
-                    if pred_depth.ndim == 2:
-                        pred_depth = pred_depth.unsqueeze(0)
-
-                    if pred_depth.shape[-2:] != target_depth.shape[-2:]:
-                        target_depth = torch.nn.functional.interpolate(
-                            target_depth.unsqueeze(0),
-                            size=pred_depth.shape[-2:],
-                            mode='bilinear',
-                            align_corners=False
-                        ).squeeze(0)
-
-                    # ---------------------------------------------------------
-                    # 核心逻辑：归一化以便可视化 (Normalize to 0-1)
-                    # ---------------------------------------------------------
-                    def normalize_for_vis(d):
-                        d_min = d.min()
-                        d_max = d.max()
-                        if (d_max - d_min) > 1e-8:
-                            return (d - d_min) / (d_max - d_min)
-                        return torch.zeros_like(d)
-
-                    # 分别归一化，侧重看“结构”是否对齐
-                    vis_pred = normalize_for_vis(pred_depth)
-                    vis_target = normalize_for_vis(target_depth)
-
-                    # ---------------------------------------------------------
-                    # 计算误差图 (Difference)
-                    # ---------------------------------------------------------
-                    # 直接计算数值差异，并放大亮度以便观察
-                    diff = torch.abs(pred_depth - target_depth)
-                    vis_diff = normalize_for_vis(diff)
-
-                    # ---------------------------------------------------------
-                    # 拼接与保存: [预测深度 | GT深度 | 误差图]
-                    # ---------------------------------------------------------
-                    vis_pred = vis_pred.repeat(3, 1, 1)
-                    vis_target = vis_target.repeat(3, 1, 1)
-                    vis_diff = vis_diff.repeat(3, 1, 1)
-
-                    vis_pred = vis_pred * valid_mask
-                    vis_target = vis_target * valid_mask
-                    vis_diff = vis_diff * valid_mask
-
-                    comparison = torch.cat([vis_pred, vis_target, vis_diff], dim=2)
-                    torchvision.utils.save_image(comparison,
-                                                 f"{debug_dir}/step_{iteration:05d}_depth.png")
-                    #print(f"[DEBUG] Saved depth check (Pred | Target | Diff) to {debug_dir}/step_{iteration:05d}_depth.png")
 
             # ==================== 法线对比 Debug====================
             if use_mono_normal and iteration % 100 == 0:
@@ -1076,42 +1053,48 @@ def training(
                 total_smooth_loss = loss_bi_rough + loss_bi_metal
                 loss += total_smooth_loss * args.lambda_bilateral
 
-            # ==========================================================
-            # [New Feature] 多视角一致性 (Multi-view Consistency)
-            # 建议不要每个 Iteration 都跑，比较耗时，比如每 5 次跑一次
-            # ==========================================================
-            if args.use_consistency and args.lambda_consistency > 0 and (iteration % 5 == 0):
-                # A. 挑选配对视角
-                # 简单策略：随机选一个视角作为 Source，再选一个距离最近的作为 Target
-                # 这里简化为随机选两个，实际建议预计算 "相邻列表"
-                idx_src = random.randint(0, len(viewpoint_stack) - 1)
-                viewpoint_src = viewpoint_stack[idx_src]
+                # ==================================================================
+                # [New Feature] 多视角一致性 (Optimized + Debug Version)
+                # ==================================================================
+                if args.use_consistency and args.lambda_consistency > 0 and (iteration % 5 == 0):
 
-                # 简单的相邻选择逻辑 (假设数据集有序)
-                idx_tgt = (idx_src + random.choice([-1, 1])) % len(viewpoint_stack)
-                viewpoint_tgt = viewpoint_stack[idx_tgt]
+                    # 1. 变量名适配 (把主循环的渲染结果拿过来复用)
+                    # 请根据你之前的报错，确认这里是 rendering_result 还是 render_pkg
+                    render_pkg_src = rendering_result
+                    viewpoint_src = viewpoint_cam
 
-                # B. 渲染两个视角
-                # 注意：这里会消耗双倍显存，如果显存不够，可以 detach 其中一个的计算图
-                render_pkg_src = render(viewpoint_src, gaussians, pipe, background)
-                render_pkg_tgt = render(viewpoint_tgt, gaussians, pipe, background)
+                    # 2. 准备 Debug 路径 (关键！之前缺的就是这里)
+                    debug_dir = None
+                    # 每 500 次保存一张 (你可以改成 100 次方便测试)
+                    if iteration % 50 == 0:
+                        debug_dir = os.path.join(args.model_path, "debug_warping")
+                        print(f"[Info] Debug warping image will be saved to {debug_dir}")
 
-                # C. 计算一致性 Loss
-                # 假设你的 render_pkg 返回了 'albedo' 和 'depth'
-                loss_consist, mask_vis = warp_consistency_loss(
-                    src_albedo=render_pkg_src["albedo"],
-                    src_depth=render_pkg_src["depth"],
-                    src_cam=viewpoint_src,
-                    tgt_albedo=render_pkg_tgt["albedo"],
-                    tgt_depth=render_pkg_tgt["depth"],
-                    tgt_cam=viewpoint_tgt
-                )
+                    # 3. 获取全量相机列表 (防止 empty range 报错)
+                    full_cam_list = scene.getTrainCameras()
 
-                loss += loss_consist * args.lambda_consistency
+                    # 4. 随机选一个邻居
+                    idx_tgt = random.randint(0, len(full_cam_list) - 1)
+                    viewpoint_tgt = full_cam_list[idx_tgt]
 
-                #可视化 Mask 看看遮挡判断对不对
-                if iteration % 10 == 0:
-                    torchvision.utils.save_image(mask_vis, "debug_mask.png")
+                    # 5. 渲染目标视角 (这是唯一额外的一次渲染)
+                    with torch.no_grad():
+                        render_pkg_tgt = render(viewpoint_tgt, gaussians, pipe, background)
+
+                    # 6. 计算 Loss (传入 debug_dir 和 iteration)
+                    loss_consist, mask_vis = warp_consistency_loss(
+                        src_albedo=render_pkg_src["albedo_map"],
+                        src_depth=render_pkg_src["depth_map"],
+                        src_cam=viewpoint_src,
+                        tgt_albedo=render_pkg_tgt["albedo_map"],
+                        tgt_depth=render_pkg_tgt["depth_map"],
+                        tgt_cam=viewpoint_tgt,
+                        save_debug_path=debug_dir,  # 【关键】传入路径
+                        iteration=iteration  # 【关键】传入迭代次数
+                    )
+
+                    loss += loss_consist * args.lambda_consistency
+
 
             #### envmap
             # TV smoothness
@@ -1643,7 +1626,7 @@ if __name__ == "__main__":
     # [New Feature] 多视角重投影一致性参数
     parser.add_argument("--use_consistency", action="store_true",
                         help="Enable multi-view reprojection consistency loss.")
-    parser.add_argument("--lambda_consistency", default=0.0, type=float,
+    parser.add_argument("--lambda_consistency", default=0.1, type=float,
                         help="Weight for consistency loss. Suggest 0.01 - 0.1")
 
     args = parser.parse_args(sys.argv[1:])
