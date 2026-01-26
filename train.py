@@ -28,6 +28,9 @@ from utils.image_utils import psnr, turbo_cmap, erode
 from utils.loss_utils import l1_loss, ssim, get_img_grad_weight, bilateral_smoothness_loss, hsv_albedo_loss
 from utils.graphics_utils import normal_from_depth_image
 
+from utils.warp_utils import warp_consistency_loss
+import random
+
 import torchvision
 
 try:
@@ -524,6 +527,9 @@ def training(
         loss_omnidata = 0.0
         use_mono_normal = getattr(dataset, "use_mono_normal", False)
         lambda_mono_normal = getattr(args, "lambda_mono_normal", 0.05)  # 注意这里 args 的作用域
+        aligned_mono_depth = None
+        render_depth = None
+
 
         # --- 计算当前权重 ---
         # 这里的 lambda_mono 和 lambda_mono_normal 是你在命令行设置的基础权重(如 0.1, 0.05)
@@ -596,25 +602,25 @@ def training(
 
                     # C. [新增] 剔除 RGB 图像中的纯黑/纯白区域 (Intensity Check)
                     # 在过曝(纯白)或欠曝(纯黑)区域，单目深度模型通常是"瞎猜"的
-                    # if hasattr(viewpoint_cam, 'original_image'):
-                    #     # 获取原始 RGB 图像 [3, H, W]，归一化到 [0, 1]
-                    #     gt_image = viewpoint_cam.original_image.cuda()
-                    #
-                    #     # 计算亮度 (灰度值)
-                    #     # Y = 0.299*R + 0.587*G + 0.114*B (简单平均也可以)
-                    #     intensity = gt_image.mean(dim=0, keepdim=True)  # [1, H, W]
-                    #
-                    #     # 设定阈值：剔除亮度 < 0.05 (极黑) 和 > 0.95 (极白) 的像素
-                    #     # 注意：如果你的场景里有纯白物体（如白墙），这个阈值要设宽一点，比如 > 0.98
-                    #     valid_rgb_mask = (intensity > 0.05) & (intensity < 0.98)
-                    #
-                    #     valid_mask &= valid_rgb_mask
+                    if hasattr(viewpoint_cam, 'original_image'):
+                        # 获取原始 RGB 图像 [3, H, W]，归一化到 [0, 1]
+                        gt_image = viewpoint_cam.original_image.cuda()
+
+                        # 计算亮度 (灰度值)
+                        # Y = 0.299*R + 0.587*G + 0.114*B (简单平均也可以)
+                        intensity = gt_image.mean(dim=0, keepdim=True)  # [1, H, W]
+
+                        # 设定阈值：剔除亮度 < 0.05 (极黑) 和 > 0.95 (极白) 的像素
+                        # 注意：如果你的场景里有纯白物体（如白墙），这个阈值要设宽一点，比如 > 0.98
+                        valid_rgb_mask = (intensity > 0.02) & (intensity < 0.99)
+
+                        valid_mask &= valid_rgb_mask
 
                     depth_loss_type = getattr(opt, "depth_loss_type", "complex")
 
                     if valid_mask.sum() > 100:  # 稍微提高阈值
+                        render_depth = 1.0 / (render_depth + 1e-6)  # 从深度转换成视差，render_depth是视差
                         aligned_mono_depth, scale, offset = align_depth_robust(mono_depth,render_depth.detach(),valid_mask)
-                        render_depth = 1.0 / (render_depth + 1e-6) #从深度转换成视差，render_depth是视差
                         #aligned_mono_depth = mono_depth
                         # ================= [改进点 1] 边缘感知权重 =================
                         # 计算单目深度的梯度幅度
@@ -753,14 +759,15 @@ def training(
                 debug_dir = os.path.join(args.model_path, "debug_depths")
                 os.makedirs(debug_dir, exist_ok=True)
 
-                # 1. 获取预测深度 (Rendered Depth)
-                pred_depth = rendering_result["depth_map"].detach()
+                # 1. 获取预测深度 (Rendered Depth) 是深度不是视差，还没处理过
+                pred_depth = render_depth.detach()#rendering_result["depth_map"].detach()
 
                 # 2. 获取单目深度 (Target Depth)
-                target_depth = None
-                if hasattr(viewpoint_cam, 'mono_depth_image'):
-                    target_depth = viewpoint_cam.mono_depth_image
-                    target_depth = 1.0 / (target_depth + 1e-6) #从深度转换成视差，render_depth是视差
+                target_depth = aligned_mono_depth.detach()
+                # target_depth = None
+                # if hasattr(viewpoint_cam, 'mono_depth_image'):
+                #     target_depth = viewpoint_cam.mono_depth_image
+                #     #target_depth = 1.0 / (target_depth + 1e-6) #从深度转换成视差，render_depth是视差
 
                 if target_depth is not None:
                     # ---------------------------------------------------------
@@ -1033,6 +1040,43 @@ def training(
                 # 3. 汇总求和
                 total_smooth_loss = loss_bi_rough + loss_bi_metal
                 loss += total_smooth_loss * args.lambda_bilateral
+
+            # ==========================================================
+            # [New Feature] 多视角一致性 (Multi-view Consistency)
+            # 建议不要每个 Iteration 都跑，比较耗时，比如每 5 次跑一次
+            # ==========================================================
+            if args.use_consistency and args.lambda_consistency > 0 and (iteration % 5 == 0):
+                # A. 挑选配对视角
+                # 简单策略：随机选一个视角作为 Source，再选一个距离最近的作为 Target
+                # 这里简化为随机选两个，实际建议预计算 "相邻列表"
+                idx_src = random.randint(0, len(viewpoint_stack) - 1)
+                viewpoint_src = viewpoint_stack[idx_src]
+
+                # 简单的相邻选择逻辑 (假设数据集有序)
+                idx_tgt = (idx_src + random.choice([-1, 1])) % len(viewpoint_stack)
+                viewpoint_tgt = viewpoint_stack[idx_tgt]
+
+                # B. 渲染两个视角
+                # 注意：这里会消耗双倍显存，如果显存不够，可以 detach 其中一个的计算图
+                render_pkg_src = render(viewpoint_src, gaussians, pipe, background)
+                render_pkg_tgt = render(viewpoint_tgt, gaussians, pipe, background)
+
+                # C. 计算一致性 Loss
+                # 假设你的 render_pkg 返回了 'albedo' 和 'depth'
+                loss_consist, mask_vis = warp_consistency_loss(
+                    src_albedo=render_pkg_src["albedo"],
+                    src_depth=render_pkg_src["depth"],
+                    src_cam=viewpoint_src,
+                    tgt_albedo=render_pkg_tgt["albedo"],
+                    tgt_depth=render_pkg_tgt["depth"],
+                    tgt_cam=viewpoint_tgt
+                )
+
+                loss += loss_consist * args.lambda_consistency
+
+                #可视化 Mask 看看遮挡判断对不对
+                if iteration % 10 == 0:
+                    torchvision.utils.save_image(mask_vis, "debug_mask.png")
 
             #### envmap
             # TV smoothness
@@ -1561,6 +1605,11 @@ if __name__ == "__main__":
     # 【新增】高光自适应掩码
     parser.add_argument("--use_specular_mask", action="store_true",
                         help="Enable self-supervised specular masking to prevent albedo baking.")
+    # [New Feature] 多视角重投影一致性参数
+    parser.add_argument("--use_consistency", action="store_true",
+                        help="Enable multi-view reprojection consistency loss.")
+    parser.add_argument("--lambda_consistency", default=0.0, type=float,
+                        help="Weight for consistency loss. Suggest 0.01 - 0.1")
 
     args = parser.parse_args(sys.argv[1:])
     args.test_iterations.append(args.iterations)
