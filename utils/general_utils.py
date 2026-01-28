@@ -14,8 +14,61 @@ from typing import Callable, Sequence
 
 import numpy as np
 import torch
+import torchvision
+import os
 from PIL import Image
 
+
+def save_pbr_debug_montage(rendering_result, gt_image, iteration, save_dir):
+    """
+    保存 PBR 训练过程中的所有分解图到一张大图里，方便一眼看出问题。
+    """
+    os.makedirs(save_dir, exist_ok=True)
+
+    with torch.no_grad():
+        # 1. 准备各个图层 (确保都在 CPU, 且 Detach)
+        # GT RGB
+        gt = gt_image.detach().cpu()
+
+        # Render RGB (PBR合成图)
+        render_rgb = rendering_result["render"].detach().cpu()
+
+        # Albedo (需 Gamma 校正显示)
+        albedo = rendering_result["albedo_map"].detach().cpu()
+        albedo = torch.clamp(albedo ** (1 / 2.2), 0, 1)
+
+        # Normal ([-1,1] -> [0,1])
+        normal = rendering_result["normal_map"].detach().cpu()
+        normal = (normal + 1.0) / 2.0
+
+        # Roughness (1通道 -> 3通道灰色)
+        rough = rendering_result["roughness_map"].detach().cpu().repeat(3, 1, 1)
+
+        # Metallic (1通道 -> 3通道灰色)
+        metal = rendering_result["metallic_map"].detach().cpu().repeat(3, 1, 1)
+
+        # Depth (伪彩色处理，或者简单归一化)
+        depth = rendering_result["depth_map"].detach().cpu()
+        depth_vis = (depth - depth.min()) / (depth.max() - depth.min() + 1e-6)
+        depth_vis = depth_vis.repeat(3, 1, 1)
+
+        # Error Map (渲染与GT的差异)
+        diff = torch.abs(render_rgb - gt)
+        diff = diff / diff.max()  # 归一化以便观察
+
+        # 2. 拼接逻辑 (2行4列)
+        # 第一行: GT | Render | Error | Depth
+        row1 = torch.cat([gt, render_rgb, diff, depth_vis], dim=2)
+        # 第二行: Albedo | Normal | Roughness | Metallic
+        row2 = torch.cat([albedo, normal, rough, metal], dim=2)
+
+        # 最终拼图
+        montage = torch.cat([row1, row2], dim=1)  # 上下拼接
+
+        # 3. 保存
+        save_path = os.path.join(save_dir, f"iter_{iteration:05d}_pbr_debug.jpg")
+        torchvision.utils.save_image(montage, save_path)
+        # print(f"[Debug] Saved montage to {save_path}")
 
 def inverse_sigmoid(x: torch.Tensor) -> torch.Tensor:
     return torch.log(x / (1 - x))
