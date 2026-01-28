@@ -23,7 +23,7 @@ from arguments import GroupParams, ModelParams, OptimizationParams, PipelinePara
 from gaussian_renderer import render
 from pbr import CubemapLight, get_brdf_lut, pbr_shading
 from scene import GaussianModel, Scene, Camera
-from utils.general_utils import safe_state
+from utils.general_utils import safe_state,save_pbr_debug_montage
 from utils.image_utils import psnr, turbo_cmap, erode
 from utils.loss_utils import l1_loss, ssim, get_img_grad_weight, bilateral_smoothness_loss, hsv_albedo_loss
 from utils.graphics_utils import normal_from_depth_image
@@ -131,57 +131,6 @@ def align_depth_robust(mono_disp, render_depth, mask):
     aligned_mono_disp = torch.clamp(aligned_mono_disp, min=eps)
 
     return aligned_mono_disp, scale, offset
-
-# #ljx:深度图尺度对齐
-# def align_depth_robust(mono_depth, render_depth, mask):
-#     """
-#     基于逆深度（视差）的鲁棒对齐 (Median / MAD)
-#     参考用户提供的 scale estimation 脚本
-#     """
-#     # 1. 转换为视差 (Disparity = 1 / Depth)
-#     # 加上 eps 防止除零
-#     eps = 1e-6
-#     # 假设 mono_depth 和 render_depth 都是线性深度 (Linear Depth)
-#     disp_mono = 1.0 / (mono_depth + eps)
-#     disp_render = 1.0 / (render_depth + eps)
-#
-#     # 2. 筛选有效区域 (Mask)
-#     # 确保深度值为正且有限
-#     valid_mask = mask & (mono_depth > eps) & (render_depth > eps) & \
-#                  torch.isfinite(disp_mono) & torch.isfinite(disp_render)
-#
-#     if valid_mask.sum() < 10:
-#         return mono_depth  # 样本过少，不处理
-#
-#     dm_masked = disp_mono[valid_mask]
-#     dr_masked = disp_render[valid_mask]
-#
-#     # 3. 计算统计量 (Median & Mean Absolute Deviation)
-#     t_mono = torch.median(dm_masked)
-#     s_mono = torch.mean(torch.abs(dm_masked - t_mono))
-#
-#     t_render = torch.median(dr_masked)
-#     s_render = torch.mean(torch.abs(dr_masked - t_render))
-#
-#     # 4. 计算 Scale 和 Offset
-#     # 目标: disp_render approx scale * disp_mono + offset
-#     if s_mono < 1e-7:
-#         scale = 1.0
-#         offset = 0.0
-#     else:
-#         scale = s_render / s_mono
-#         offset = t_render - scale * t_mono
-#
-#     # 5. 应用对齐 (在视差空间)
-#     aligned_disp = scale * disp_mono + offset
-#
-#     # 6. 转回深度空间
-#     # 处理负视差或极小值 (对应无限远或错误点)，截断到非常远但有限的深度
-#     aligned_disp = torch.clamp(aligned_disp, min=eps)
-#     aligned_mono_depth = 1.0 / aligned_disp
-#
-#     return aligned_mono_depth,scale,offset
-
 
 def pearson_correlation_loss(pred, target, mask=None):
     """
@@ -558,6 +507,7 @@ def training(
         normal_loss = 0.0
         loss_mono_depth = 0.0
         loss_omnidata = 0.0
+        loss_consist = 0.0  # 【新增】初始化一致性 Loss
 
         aligned_mono_depth = None
 
@@ -845,8 +795,6 @@ def training(
                     # if iteration % 1000 == 0:
                     #     print(f"Normal Consistency Kept: {Mn.sum()/gt_alpha_mask.sum():.2%}")
 
-
-
             # ==================== 法线对比 Debug====================
             if use_mono_normal and iteration % 100 == 0:
                 if hasattr(viewpoint_cam, 'mono_normal_image') and viewpoint_cam.mono_normal_image is not None:
@@ -1037,7 +985,7 @@ def training(
             # [Feature] 全局双边平滑约束 (Global Bilateral Smoothness)
             # 目标: Albedo, Roughness, Metallic, Normal
             # ==================================================================
-            if args.lambda_bilateral > 0 and (normal_mask.sum() > 0):
+            if args.use_bilateral_loss and args.lambda_bilateral > 0 and (normal_mask.sum() > 0):
                 # 1. 准备引导图 (GT Image 是最稳的 Ground Truth)
                 # detach 很重要，防止梯度传回 GT 导致逻辑混乱，虽然 GT 本身也没梯度
                 guide_img = gt_image.detach()
@@ -1053,48 +1001,55 @@ def training(
                 total_smooth_loss = loss_bi_rough + loss_bi_metal
                 loss += total_smooth_loss * args.lambda_bilateral
 
-                # ==================================================================
-                # [New Feature] 多视角一致性 (Optimized + Debug Version)
-                # ==================================================================
-                if args.use_consistency and args.lambda_consistency > 0 and (iteration % 5 == 0):
+            # ==================================================================
+            # [New Feature] 多视角一致性 (Optimized + Debug Version)
+            # ==================================================================
+            if args.use_consistency and args.lambda_consistency > 0 and iteration > 3200 and (iteration % 5 == 0):
 
-                    # 1. 变量名适配 (把主循环的渲染结果拿过来复用)
-                    # 请根据你之前的报错，确认这里是 rendering_result 还是 render_pkg
-                    render_pkg_src = rendering_result
-                    viewpoint_src = viewpoint_cam
+                # 1. 变量名适配 (把主循环的渲染结果拿过来复用)
+                # 请根据你之前的报错，确认这里是 rendering_result 还是 render_pkg
+                render_pkg_src = rendering_result
+                viewpoint_src = viewpoint_cam
 
-                    # 2. 准备 Debug 路径 (关键！之前缺的就是这里)
-                    debug_dir = None
-                    # 每 500 次保存一张 (你可以改成 100 次方便测试)
-                    if iteration % 50 == 0:
-                        debug_dir = os.path.join(args.model_path, "debug_warping")
-                        print(f"[Info] Debug warping image will be saved to {debug_dir}")
+                # 2. 准备 Debug 路径 (关键！之前缺的就是这里)
+                debug_dir = None
+                # 每 500 次保存一张 (你可以改成 100 次方便测试)
+                if iteration % 50 == 0:
+                    debug_dir = os.path.join(args.model_path, "debug_warping")
+                    print(f"[Info] Debug warping image will be saved to {debug_dir}")
 
-                    # 3. 获取全量相机列表 (防止 empty range 报错)
-                    full_cam_list = scene.getTrainCameras()
+                # 3. 获取全量相机列表 (防止 empty range 报错)
+                full_cam_list = scene.getTrainCameras()
 
-                    # 4. 随机选一个邻居
-                    idx_tgt = random.randint(0, len(full_cam_list) - 1)
-                    viewpoint_tgt = full_cam_list[idx_tgt]
+                # 4. 随机选一个邻居
+                idx_tgt = random.randint(0, len(full_cam_list) - 1)
+                viewpoint_tgt = full_cam_list[idx_tgt]
 
-                    # 5. 渲染目标视角 (这是唯一额外的一次渲染)
-                    with torch.no_grad():
-                        render_pkg_tgt = render(viewpoint_tgt, gaussians, pipe, background)
+                # 5. 渲染目标视角 (这是唯一额外的一次渲染)
+                with torch.no_grad():
+                    render_pkg_tgt = render(viewpoint_tgt, gaussians, pipe, background)
 
-                    # 6. 计算 Loss (传入 debug_dir 和 iteration)
-                    loss_consist, mask_vis = warp_consistency_loss(
-                        src_albedo=render_pkg_src["albedo_map"],
-                        src_depth=render_pkg_src["depth_map"],
-                        src_cam=viewpoint_src,
-                        tgt_albedo=render_pkg_tgt["albedo_map"],
-                        tgt_depth=render_pkg_tgt["depth_map"],
-                        tgt_cam=viewpoint_tgt,
-                        save_debug_path=debug_dir,  # 【关键】传入路径
-                        iteration=iteration  # 【关键】传入迭代次数
-                    )
+                # 6. 计算 Loss (传入 debug_dir 和 iteration)
+                loss_consist, mask_vis = warp_consistency_loss(
+                    src_albedo=render_pkg_src["albedo_map"],
+                    src_depth=render_pkg_src["depth_map"],
+                    src_cam=viewpoint_src,
+                    tgt_albedo=render_pkg_tgt["albedo_map"],
+                    tgt_depth=render_pkg_tgt["depth_map"],
+                    tgt_cam=viewpoint_tgt,
+                    save_debug_path=debug_dir,  # 【关键】传入路径
+                    iteration=iteration  # 【关键】传入迭代次数
+                )
 
-                    loss += loss_consist * args.lambda_consistency
+                loss += loss_consist * args.lambda_consistency
 
+            if iteration % 100 == 0:
+                save_pbr_debug_montage(
+                    rendering_result=rendering_result,
+                    gt_image=gt_image,
+                    iteration=iteration,
+                    save_dir=os.path.join(args.model_path, "debug_pbr_montage")
+                )
 
             #### envmap
             # TV smoothness
@@ -1110,6 +1065,31 @@ def training(
             tv_w1 = torch.pow(envmap[:, 1:, :] - envmap[:, :-1, :], 2).mean()
             env_tv_loss = tv_h1 + tv_w1
             loss += env_tv_loss * env_tv_weight
+
+            # =========================================================
+            # [New Feature] 光照正则化 (Light Regularization / Neutral Prior)
+            # =========================================================
+            # 只有当开启参数且进入 PBR 阶段时执行
+            if args.use_light and +args.lambda_light > 0:
+                # 1. 获取当前采样的环境光颜色 [H, W, 3]
+                # 注意：这里直接复用你代码里已经算好的 envmap 变量
+                # envmap = dr.texture(...) # 确保这行在你插入代码之前已经运行了
+
+                if 'envmap' in locals():
+                    # 2. 计算每个像素的 RGB 均值 (即亮度/灰度) -> [H, W, 1]
+                    mean_intensity = envmap.mean(dim=-1, keepdim=True)
+
+                    # 3. 计算每个通道与均值的偏差 (L1 距离)
+                    # 这一步就是图片里公式的工程实现：让 R, G, B 都去接近 Mean
+                    color_bias = torch.abs(envmap - mean_intensity)
+
+                    # 4. 求平均得到 Loss
+                    loss_light_reg = color_bias.mean()
+
+                    # 5. 加到总 Loss 里
+                    loss += loss_light_reg * args.lambda_light
+
+            # =========================================================
 
         loss.backward()
         # print("back")
@@ -1145,6 +1125,18 @@ def training(
                 if use_mono_depth:
                     loss_log["New_D"] = f"{loss_mono_depth_val:.{5}f}"
                     loss_log["New_N"] = f"{loss_omnidata_val:.{5}f}"
+
+
+                # 【新增】获取一致性 Loss 的数值
+                # 因为你设置了每 5 步算一次，没算的时候它就是 0.0
+                if isinstance(loss_consist, torch.Tensor):
+                    loss_consist_val = loss_consist.item()
+                else:
+                    loss_consist_val = loss_consist
+                # 只有当开启了功能，且进入了 PBR 阶段，且数值不为 0 时才显示
+                if args.use_consistency and iteration > pbr_iteration:
+                    loss_log["Con"] = f"{loss_consist_val:.{5}f}"
+                # =========================================================
 
                 # 3. 更新进度条 (注意这里的缩进，必须在 if use_mono_depth 外面)
                 progress_bar.set_postfix(loss_log)
@@ -1628,6 +1620,13 @@ if __name__ == "__main__":
                         help="Enable multi-view reprojection consistency loss.")
     parser.add_argument("--lambda_consistency", default=0.1, type=float,
                         help="Weight for consistency loss. Suggest 0.01 - 0.1")
+
+    # [新增] 开关中性光loss
+    # action='store_true' 表示：只要命令行里写了 --use_light，这个值就是 True，否则是 False
+    parser.add_argument("--use_light", action='store_true', default=False,
+                        help="Switch to enable light optimization/regularization module")
+    # 权重参数
+    parser.add_argument("--lambda_light", type=float, default=0.01, help="Weight for light regularization")
 
     args = parser.parse_args(sys.argv[1:])
     args.test_iterations.append(args.iterations)
