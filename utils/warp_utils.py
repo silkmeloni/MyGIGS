@@ -102,21 +102,29 @@ def reproject_to_view(world_points, target_camera):
     return grid, proj_depth
 
 
-def get_depth_gradient_mask(depth, threshold=0.1):
+def get_depth_edge_mask(depth, threshold=0.05):
     """
-    计算深度图梯度，返回平滑区域的 Mask
+    [Layer 2] 计算深度图边缘 Mask
+    原理：深度梯度大的地方是物体边缘，容易产生 Warping 误差，必须剔除。
     """
-    # depth: [1, 1, H, W]
+    # depth: [B, 1, H, W]
+
+    # 简单的 Sobel 算子或差分计算梯度
+    # dy: 垂直梯度, dx: 水平梯度
     dy = torch.abs(depth[..., 1:, :] - depth[..., :-1, :])
     dx = torch.abs(depth[..., :, 1:] - depth[..., :, :-1])
 
-    # 填充回原尺寸
+    # Padding 回原尺寸
     dy = F.pad(dy, (0, 0, 0, 1))
     dx = F.pad(dx, (0, 1, 0, 0))
 
-    grad = dy + dx
-    mask = (grad < threshold).float()
-    return mask
+    grad_mag = dy + dx
+
+    # 梯度小于阈值的地方是平坦区域 (Valid)，梯度大的地方是边缘 (Invalid)
+    # threshold 需要根据你的深度尺度调整，一般 0.05 - 0.1 左右
+    edge_mask = (grad_mag < threshold).float()
+
+    return edge_mask
 
 
 def warp_consistency_loss(
@@ -124,95 +132,179 @@ def warp_consistency_loss(
         tgt_albedo, tgt_depth, tgt_cam,
         save_debug_path=None,
         iteration=0,
-        robust_threshold=0.1,
+        margin=0.03,  # [Layer 3] 容忍度阈值
         patch_size=3
 ):
     """
-    改进版：包含高光剔除、边缘保护和 Patch 平滑的一致性 Loss
+    改进版单向光度一致性 Loss (Robust Unidirectional Consistency)
+    包含: 几何遮挡Mask + 边缘Mask + 高光容忍度Mask
     """
-    # ================= [Fix: 维度统一标准化] =================
-    # 确保所有输入都是 [1, C, H, W] 格式 (4维)
-    # 这样后续访问 shape[2], shape[3] 就不会报错了
-    if src_depth.dim() == 3: src_depth = src_depth.unsqueeze(0)
-    if tgt_depth.dim() == 3: tgt_depth = tgt_depth.unsqueeze(0)
+
+    # ==========================================
+    # 1. 维度标准化 (保持不变)
+    # ==========================================
+    if src_depth.dim() == 4:
+        src_depth_3d = src_depth.squeeze(1)
+    else:
+        src_depth_3d = src_depth
+
+    if src_depth.dim() == 3:
+        src_depth_4d = src_depth.unsqueeze(1)
+    else:
+        src_depth_4d = src_depth
+
+    if tgt_depth.dim() == 3:
+        tgt_depth_4d = tgt_depth.unsqueeze(1)
+    else:
+        tgt_depth_4d = tgt_depth
+
     if src_albedo.dim() == 3: src_albedo = src_albedo.unsqueeze(0)
     if tgt_albedo.dim() == 3: tgt_albedo = tgt_albedo.unsqueeze(0)
-    # ========================================================
 
-    # 1. 坐标变换 & 基础投影
-    xyz_world = depth_point_to_world(src_depth, src_cam)
+    # ==========================================
+    # 2. 几何变换 Warping (保持不变)
+    # ==========================================
+    # 这一步需要你的 depth_point_to_world 和 reproject_to_view 辅助函数
+    # 假设它们已经定义在 utils 里
+    from utils.warp_utils import depth_point_to_world, reproject_to_view
+
+    xyz_world = depth_point_to_world(src_depth_3d, src_cam)
     grid, projected_z = reproject_to_view(xyz_world, tgt_cam)
 
-    # 2. 采样
+    # 采样 Target 视角的 Albedo 和 Depth
     warped_tgt_albedo = F.grid_sample(tgt_albedo, grid, align_corners=True, padding_mode='border')
-    warped_tgt_depth = F.grid_sample(tgt_depth, grid, align_corners=True, padding_mode='border')
+    warped_tgt_depth = F.grid_sample(tgt_depth_4d, grid, align_corners=True, padding_mode='border')
 
-    # ================= [改进 1: 更严格的 Mask] =================
+    # ==========================================
+    # 3. 构建三层防御 Mask
+    # ==========================================
 
-    # A. 几何遮挡 Mask (Occlusion)
-    depth_bias = 0.02
-    #occ_mask = (projected_z < (warped_tgt_depth + depth_bias)).float()
+    # --- [Layer 1] 几何遮挡 Mask (Geometric Occlusion) ---
+    # 只有当投影深度 和 实际深度 接近时，才说明没有被遮挡
+    depth_bias = 0.05
+    occ_mask = (projected_z < (warped_tgt_depth + depth_bias)).float()
 
-    # B. 视锥边界 Mask (FOV)
-    # 使用 shape[-2] 和 shape[-1] 来动态获取 H, W，更加安全
-    H, W = src_depth.shape[-2:]
-    bound_mask = (grid.abs().max(dim=-1)[0] < 0.95).float().view(1, 1, H, W)
+    # 边界检查 (视锥体外的点不要)
+    bound_mask = (grid.abs().max(dim=-1)[0] < 0.95).float().unsqueeze(1)
 
-    # C. 深度边缘 Mask (Geometric Edge)
-    edge_mask = get_depth_gradient_mask(src_depth, threshold=0.05)
+    valid_geo_mask = occ_mask * bound_mask
 
-    # 基础几何 Mask
-    geo_mask = bound_mask * edge_mask #* occ_mask
+    # --- [Layer 2] 边缘 Mask (Edge/Gradient Mask) ---
+    # 剔除 Source 深度图中的剧烈边缘，防止纹理在轮廓处糊掉
+    edge_mask = get_depth_edge_mask(src_depth_4d, threshold=0.1)
 
-    # ================= [改进 2: 鲁棒的光度误差计算] =================
+    # 合并前两层 Mask (物理层面的有效性)
+    physics_mask = valid_geo_mask * edge_mask
 
-    # 计算原始 L1 误差
-    raw_diff = torch.abs(src_albedo - warped_tgt_albedo).mean(dim=1, keepdim=True)  # [1, 1, H, W]
+    # --- [Layer 3] 单向高光判定 & 容忍度 (Unidirectional Logic) ---
+    # 核心公式: Diff = Src - Warped_Target
+    # 我们只惩罚 Diff > margin 的情况 (显著变亮)
 
-    # D. 动态光度 Mask (Outlier Rejection) - 剔除高光
-    photo_mask = (raw_diff < robust_threshold).float()
+    # .detach() 很重要！我们把 Warped Target 当作"Ground Truth"，不传梯度给它
+    ref_target = warped_tgt_albedo.detach()
+    diff = src_albedo - ref_target
 
-    # 最终 Mask
-    final_mask = geo_mask * photo_mask
+    # 只有当 Src 比 Tgt 显著亮 (大于 margin) 时，Mask 为 1
+    # 这种区域被认为是: "疑似高光区域"
+    is_specular_mask = (diff > margin).float()
 
-    # ================= [改进 3: Patch-based Loss] =================
-
+    # 对 diff 取 Patch 平均，增强鲁棒性 (可选)
+    # 如果像素级噪声大，建议加上这个
     if patch_size > 1:
-        diff_patched = F.avg_pool2d(raw_diff, kernel_size=patch_size, stride=1, padding=patch_size // 2)
-    else:
-        diff_patched = raw_diff
+        diff_patched = F.avg_pool2d(diff, kernel_size=patch_size, stride=1, padding=patch_size // 2)
+        is_specular_mask = (diff_patched > margin).float()
 
-    # 计算最终 Loss
+    # ==========================================
+    # 4. 最终 Mask 与 Loss 计算
+    # ==========================================
+
+    # 最终参与计算的像素必须满足:
+    # 1. 物理上没遮挡 (Layer 1)
+    # 2. 不是物体边缘 (Layer 2)
+    # 3. 确实是显著变亮的高光 (Layer 3)
+    final_mask = physics_mask * is_specular_mask
+
+    # 统计有效像素数
     valid_count = final_mask.sum()
+
     if valid_count < 10:
         loss = torch.tensor(0.0, device=src_albedo.device)
     else:
-        loss = (diff_patched * final_mask).sum() / (valid_count + 1e-6)
+        # 只惩罚变亮的部分
+        # L1 Loss: abs(diff)
+        # 注意: 因为 mask 保证了 diff > 0，所以 abs 其实可以不加，但加上更保险
+        loss = (torch.abs(diff) * final_mask).sum() / (valid_count + 1e-6)
 
-    # ================= [Debug 可视化] =================
+    # =========================================================
+    # 5. Debug 可视化 (修复维度版)
+    # =========================================================
     if save_debug_path is not None:
         os.makedirs(save_debug_path, exist_ok=True)
         with torch.no_grad():
             img_src = src_albedo.detach()
+            img_tgt_raw = tgt_albedo.detach()
             img_warp = warped_tgt_albedo.detach()
-            img_tgt_ref = F.interpolate(tgt_albedo, size=img_src.shape[2:], mode='bilinear')
 
-            # Mask 可视化
+            # --- [修复点] 制作 Overlay Mask ---
+            img_overlay = img_src.clone()
+
+            # 1. 处理 Mask 维度
+            # final_mask 目前是 [1, 3, H, W]，我们需要把它压扁成 [1, 1, H, W]
+            # 逻辑：只要 RGB 任意通道被判定为高光，该像素就算高光 (取 max)
+            if final_mask.shape[1] == 3:
+                mask_1ch = final_mask.max(dim=1, keepdim=True)[0]
+            else:
+                mask_1ch = final_mask
+
+            # 2. 扩展为 3 通道用于图片混合 [1, 3, H, W]
+            mask_3ch = mask_1ch.repeat(1, 3, 1, 1)
+
+            # 3. 定义高亮颜色 (纯红)
+            highlight_color = torch.tensor([1.0, 0.0, 0.0], device=img_src.device).view(1, 3, 1, 1)
+
+            # 4. 混合
+            img_overlay = torch.where(
+                mask_3ch > 0.5,
+                img_src * 0.6 + highlight_color * 0.4,
+                img_src
+            )
+
+            # --- Mask 通道可视化 ---
+            # 为了可视化，我们也需要把 final_mask 和 edge_mask 统一成单通道展示
             vis_mask = torch.zeros_like(img_src)
-            vis_mask[:, 0, :, :] = final_mask[:, 0, :, :]
-            vis_mask[:, 1, :, :] = (geo_mask * (1 - photo_mask))[:, 0, :, :]
-            vis_mask[:, 2, :, :] = (1 - geo_mask)[:, 0, :, :]
 
-            # Error Map
-            img_error = raw_diff.repeat(1, 3, 1, 1).detach() * 5.0
+            # R通道: Final Mask (压扁后的单通道)
+            vis_mask[:, 0, :, :] = mask_1ch[:, 0, :, :]
 
-            combined = torch.cat([img_src, img_warp, vis_mask, img_error, img_tgt_ref], dim=3)
+            # G通道: Edge Mask (如果是3通道也压扁)
+            if edge_mask.shape[1] == 3:
+                edge_mask_vis = edge_mask.max(dim=1, keepdim=True)[0]
+            else:
+                edge_mask_vis = edge_mask
+            vis_mask[:, 1, :, :] = edge_mask_vis[:, 0, :, :]
+
+            # B通道: Occ Mask
+            if valid_geo_mask.shape[1] == 3:
+                geo_mask_vis = valid_geo_mask.max(dim=1, keepdim=True)[0]
+            else:
+                geo_mask_vis = valid_geo_mask
+            vis_mask[:, 2, :, :] = geo_mask_vis[:, 0, :, :]
+
+            # --- 误差热力图 ---
+            # 同样把 diff 压扁或者取平均显示
+            diff_vis = torch.clamp(diff, 0, 1).mean(dim=1, keepdim=True).repeat(1, 3, 1, 1) * 5.0
+
+            # --- 六图拼接 ---
+            combined = torch.cat([
+                img_src,
+                img_tgt_raw,
+                img_warp,
+                img_overlay,
+                vis_mask,
+                diff_vis
+            ], dim=3)
 
             file_name = os.path.join(save_debug_path, f"debug_warp_{iteration:05d}.jpg")
             torchvision.utils.save_image(combined, file_name)
-
-            if iteration % 100 == 0:
-                print(
-                    f"[Iter {iteration}] Warp Stats: Valid {final_mask.mean():.1%} | Specular Rejected {(geo_mask * (1 - photo_mask)).mean():.1%}")
 
     return loss, final_mask

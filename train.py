@@ -426,33 +426,32 @@ def training(
     normal_min_ratio = 0.0  # 法线最后建议完全关闭，否则会影响高频纹理
 
     # =========================================================
-    # [Pre-compute] 基于位置计算最近邻
+    # [Pre-compute] 基于 3D 空间距离的 KNN 邻居表
     # =========================================================
+    print("正在计算相机空间距离矩阵 (Spatial KNN)...")
+
     train_cameras = scene.getTrainCameras()
-    neighbor_map = {}  # {cam_uid: neighbor_cam}
+    num_cams = len(train_cameras)
 
-    print("Computing spatial nearest neighbors...")
+    # 1. 提取所有相机中心 [N, 3]
+    # 注意：确保 train_cameras 里的顺序在之后不会变
+    cam_centers = torch.stack([cam.camera_center for cam in train_cameras]).to("cuda")
 
-    # 提取所有相机中心
-    # standard 3DGS camera center is usually at cam.camera_center
-    cam_centers = torch.stack([cam.camera_center for cam in train_cameras])  # [N, 3]
+    # 2. 计算距离矩阵 [N, N]
+    # dists[i, j] 代表第 i 个相机和第 j 个相机的距离
+    dists = torch.cdist(cam_centers[None, ...], cam_centers[None, ...]).squeeze(0)
 
-    # 计算距离矩阵 [N, N]
-    # dist[i, j] 是第 i 个相机和第 j 个相机的距离
-    # 注意：为了避免显存爆炸，如果 N 很大 (>1000)，可以用循环算
-    N = len(train_cameras)
-    for i in range(N):
-        current_center = cam_centers[i]
-        dists = torch.norm(cam_centers - current_center, dim=1)  # [N]
+    # 3. 获取排序后的索引 [N, N]
+    # sorted_indices[i, 0] 是自己 (距离为0)
+    # sorted_indices[i, 1] 是最近的邻居
+    # sorted_indices[i, 2] 是第二近的邻居...
+    _, sorted_indices = torch.sort(dists, dim=1)
 
-        # 将自己设为无限远，防止选到自己
-        dists[i] = float('inf')
+    # 转回 CPU 存起来，省显存
+    # 这里存的是 train_cameras 列表里的下标索引
+    knn_map = sorted_indices.cpu().numpy()
 
-        # 找到最近的那个索引
-        nearest_idx = torch.argmin(dists).item()
-
-        # 建立映射: 当前相机 -> 最近的邻居相机
-        neighbor_map[train_cameras[i].uid] = train_cameras[nearest_idx]
+    print("空间邻居表构建完成。")
     # =========================================================
 
 
@@ -1053,8 +1052,48 @@ def training(
                 full_cam_list = scene.getTrainCameras()
 
                 # 4. 随机选一个邻居
-                #idx_tgt = random.randint(0, len(full_cam_list) - 1)
-                viewpoint_tgt = neighbor_map[viewpoint_cam.uid]#full_cam_list[idx_tgt]
+                # =========================================================
+                # [Spatial Search] 空间最近邻采样
+                # =========================================================
+                viewpoint_tgt = None
+
+                # 定义物理邻居的排名范围 (Rank Range)
+                # 1 是最近的，但可能重叠度太高，视差太小
+                # 建议从 2 或 3 开始，到 6 或 8 结束
+                # 这样既保证了有视差，又保证了重叠度够高，能Warp成功
+                RANK_MIN = 2
+                RANK_MAX = 6
+
+                try:
+                    # 1. 我们需要知道当前 viewpoint_cam 在 train_cameras 列表里的下标
+                    # 也就是它的 uid
+                    # 注意：这里假设 viewpoint_cam.uid 对应 train_cameras 的索引
+                    # 如果不对应，可以用 train_cameras.index(viewpoint_cam) 查找(稍慢)
+                    curr_idx = viewpoint_cam.uid
+
+                    # 2. 随机选择一个排名
+                    # 限制范围，防止越界 (比如只有3张图)
+                    actual_max = min(RANK_MAX, num_cams - 1)
+                    actual_min = min(RANK_MIN, actual_max)
+
+                    if actual_max > actual_min:
+                        rand_rank = random.randint(actual_min, actual_max)
+
+                        # 3. 从 KNN 表里查出那个邻居的索引
+                        tgt_idx = knn_map[curr_idx][rand_rank]
+
+                        # 4. 取出相机
+                        viewpoint_tgt = train_cameras[tgt_idx]
+
+                except Exception:
+                    pass
+
+                # 5. 保底机制
+                if viewpoint_tgt is None:
+                    rand_idx = random.randint(0, len(train_cameras) - 1)
+                    viewpoint_tgt = train_cameras[rand_idx]
+
+                # =========================================================
 
                 # 5. 渲染目标视角 (这是唯一额外的一次渲染)
                 with torch.no_grad():
