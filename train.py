@@ -425,6 +425,37 @@ def training(
     normal_end = 15000  # 法线结束要早一点
     normal_min_ratio = 0.0  # 法线最后建议完全关闭，否则会影响高频纹理
 
+    # =========================================================
+    # [Pre-compute] 基于位置计算最近邻
+    # =========================================================
+    train_cameras = scene.getTrainCameras()
+    neighbor_map = {}  # {cam_uid: neighbor_cam}
+
+    print("Computing spatial nearest neighbors...")
+
+    # 提取所有相机中心
+    # standard 3DGS camera center is usually at cam.camera_center
+    cam_centers = torch.stack([cam.camera_center for cam in train_cameras])  # [N, 3]
+
+    # 计算距离矩阵 [N, N]
+    # dist[i, j] 是第 i 个相机和第 j 个相机的距离
+    # 注意：为了避免显存爆炸，如果 N 很大 (>1000)，可以用循环算
+    N = len(train_cameras)
+    for i in range(N):
+        current_center = cam_centers[i]
+        dists = torch.norm(cam_centers - current_center, dim=1)  # [N]
+
+        # 将自己设为无限远，防止选到自己
+        dists[i] = float('inf')
+
+        # 找到最近的那个索引
+        nearest_idx = torch.argmin(dists).item()
+
+        # 建立映射: 当前相机 -> 最近的邻居相机
+        neighbor_map[train_cameras[i].uid] = train_cameras[nearest_idx]
+    # =========================================================
+
+
     for iteration in range(first_iter + 1, opt.iterations + 1):  # the real iteration (1 shift)
         iter_start.record()
         # Every 1000 its we increase the levels of SH up to a maximum degree
@@ -1022,8 +1053,8 @@ def training(
                 full_cam_list = scene.getTrainCameras()
 
                 # 4. 随机选一个邻居
-                idx_tgt = random.randint(0, len(full_cam_list) - 1)
-                viewpoint_tgt = full_cam_list[idx_tgt]
+                #idx_tgt = random.randint(0, len(full_cam_list) - 1)
+                viewpoint_tgt = neighbor_map[viewpoint_cam.uid]#full_cam_list[idx_tgt]
 
                 # 5. 渲染目标视角 (这是唯一额外的一次渲染)
                 with torch.no_grad():
