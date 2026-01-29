@@ -558,6 +558,7 @@ def readCamerasFromTransforms(
                 width=image.size[0],
                 height=image.size[1],
                 depth_mono_path=None,  # <--- 传入路径
+                normal_mono_path=None
             )
         )
 
