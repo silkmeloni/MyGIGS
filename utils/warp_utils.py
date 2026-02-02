@@ -132,184 +132,127 @@ def warp_consistency_loss(
         tgt_albedo, tgt_depth, tgt_cam,
         save_debug_path=None,
         iteration=0,
-        margin_ratio=0.10,  # [策略] 容忍度: 只有比邻居亮 10% 以上才算高光
-        patch_size=5  # [策略] Patch大小: 使用 5x5 区域均值对比，抗噪
+        margin=0.03,
+        patch_size=7
 ):
     """
-    终极版：基于 Patch 的鲁棒单向光度一致性 Loss
-    Robust Unidirectional Photometric Consistency Loss (Patch-based)
+    [能量守恒修正版] 零均值单向一致性 Loss
+    Zero-Mean Unidirectional Consistency (Energy Preserving)
     """
 
-    # ==========================================
-    # 1. 维度标准化 (Standardize Dimensions)
-    # ==========================================
+    # --- 1. 维度处理 & 2. Warping (保持不变) ---
     if src_depth.dim() == 4:
         src_depth_3d = src_depth.squeeze(1)
     else:
         src_depth_3d = src_depth
-
     if src_depth.dim() == 3:
         src_depth_4d = src_depth.unsqueeze(1)
     else:
         src_depth_4d = src_depth
-
     if tgt_depth.dim() == 3:
         tgt_depth_4d = tgt_depth.unsqueeze(1)
     else:
         tgt_depth_4d = tgt_depth
-
     if src_albedo.dim() == 3: src_albedo = src_albedo.unsqueeze(0)
     if tgt_albedo.dim() == 3: tgt_albedo = tgt_albedo.unsqueeze(0)
 
-    # ==========================================
-    # 2. 几何变换 Warping
-    # ==========================================
+    from utils.warp_utils import depth_point_to_world, reproject_to_view
     xyz_world = depth_point_to_world(src_depth_3d, src_cam)
     grid, projected_z = reproject_to_view(xyz_world, tgt_cam)
 
-    # 采样 Target 视角的 Albedo 和 Depth
-    # padding_mode='zeros' 是默认的，这会导致边界外是黑色，所以下面必须有 mask
     warped_tgt_albedo = F.grid_sample(tgt_albedo, grid, align_corners=True, padding_mode='zeros')
     warped_tgt_depth = F.grid_sample(tgt_depth_4d, grid, align_corners=True, padding_mode='zeros')
-
-    # .detach() 极其重要！把 Target 当作不可变的 Ground Truth
     ref_target = warped_tgt_albedo.detach()
 
-    # ==========================================
-    # 3. 构建三层防御 Mask (Physics Validity)
-    # ==========================================
-
-    # [Layer 1] 有效网格 Mask (Valid Grid)
-    # 剔除采样到了图像边界以外(黑色)的像素。防止"向黑边学习"导致整体变暗。
+    # --- 3. 物理 Mask (保持不变) ---
     valid_grid_mask = (grid.abs().max(dim=-1)[0] < 0.99).float().unsqueeze(1)
-
-    # [Layer 2] 几何遮挡 Mask (Occlusion)
     depth_bias = 0.02
     occ_mask = (projected_z < (warped_tgt_depth + depth_bias)).float()
 
-    # [Layer 3] 边缘 Mask (Edge)
-    # 剔除深度跳变剧烈的边缘，防止轮廓模糊
-    edge_mask = get_depth_edge_mask(src_depth_4d, threshold=0.08)
+    # [边缘剔除]
+    dy = torch.abs(src_depth_4d[..., 1:, :] - src_depth_4d[..., :-1, :])
+    dx = torch.abs(src_depth_4d[..., :, 1:] - src_depth_4d[..., :, :-1])
+    dy = F.pad(dy, (0, 0, 0, 1));
+    dx = F.pad(dx, (0, 1, 0, 0))
+    edge_mask = ((dy + dx) < 0.08).float()
 
-    # 合并物理有效性 Mask
     physics_mask = valid_grid_mask * occ_mask * edge_mask
 
     # ==========================================
-    # 4. Patch 级高光判定 (Patch-based Detection)
+    # [核心修正] 零均值 (Zero-Mean) 分解
     # ==========================================
 
-    # 定义均值池化 (眯着眼睛看图，忽略噪点)
-    def get_patch_mean(img):
-        return F.avg_pool2d(
-            img,
-            kernel_size=patch_size,
-            stride=1,
-            padding=patch_size // 2
-        )
+    # 1. 计算局部能量 (DC分量)
+    # 使用较大的 Patch (如 7x7) 来统计局部照明条件
+    def get_local_mean(img):
+        return F.avg_pool2d(img, kernel_size=patch_size, stride=1, padding=patch_size // 2)
 
-    # 计算局部均值
-    src_mean = get_patch_mean(src_albedo)
-    tgt_mean = get_patch_mean(ref_target)
+    src_dc = get_local_mean(src_albedo)
+    tgt_dc = get_local_mean(ref_target)
 
-    # 计算相对比率 Ratio = Src / Target
-    eps = 1e-5
-    ratio_patch = (src_mean + eps) / (tgt_mean + eps)
+    # 2. 剥离能量，获得纯结构 (AC分量)
+    # Src_AC: 这里的正值代表"比周围亮"，负值代表"比周围暗"
+    src_ac = src_albedo - src_dc
+    tgt_ac = ref_target - tgt_dc
 
-    # [核心判定]
-    # 只有当 (物理有效) AND (区域亮度比邻居亮 10% 以上)
-    # 我们才认定这是"必须去除的高光"
-    is_specular_mask = (ratio_patch > (1.0 + margin_ratio)).float()
+    # ==========================================
+    # [单向约束] 只砍高频尖峰
+    # ==========================================
 
-    # 最终计算 Loss 的 Mask
+    # 逻辑：
+    # Src_AC > 0.1 表示 Src 这里有个很亮的尖峰 (相对于它自己的背景)
+    # Tgt_AC < 0.0 表示 Tgt 这里很平坦，或者比背景暗
+    # 差异 diff > 0 表示 Src 的尖峰程度 远大于 Tgt
+
+    # 我们只比较 AC 分量！这样完全忽略了 DC (整体亮度) 的差异
+    diff_ac = src_ac - tgt_ac
+
+    # 判定高光：只有当"结构上的突起"显著大于邻居时
+    is_specular_mask = (diff_ac > margin).float()
+
     final_mask = physics_mask * is_specular_mask
-
-    # ==========================================
-    # 5. Loss 计算策略 (Luminance + Chroma)
-    # ==========================================
     valid_count = final_mask.sum()
 
     if valid_count < 10:
         loss = torch.tensor(0.0, device=src_albedo.device)
     else:
-        # A. 亮度 Loss (Luminance Penalty)
-        # 我们希望 Src 的亮度下降，去接近那个"更暗"的 Tgt
-        # 使用 Patch 均值计算 Loss，梯度更平滑
-        loss_lum = torch.abs(src_mean.mean(dim=1, keepdim=True) - tgt_mean.mean(dim=1, keepdim=True))
+        # [Loss 计算]
+        # 即使被判定为高光，我们惩罚什么？
+        # 我们惩罚的是 diff_ac (结构的差异)，而不是 src_albedo (绝对亮度)
+        # 这意味着：梯度只会去削平那个尖峰，而不会把整个地基往下压
+        loss = (torch.abs(diff_ac) * final_mask).sum() / (valid_count + 1e-6)
 
-        # B. 色度 Loss (Chromaticity Constraint)
-        # 即使亮度要下降，我们要求 RGB 的方向(色相)不能变，防止变成灰色
+        # 辅以色度保护 (能量守恒的最后一道防线：颜色方向不变)
         src_norm = F.normalize(src_albedo, dim=1, eps=1e-6)
         tgt_norm = F.normalize(ref_target, dim=1, eps=1e-6)
-        # Cosine Distance: 1 - cos(theta)
         loss_chroma = 1.0 - (src_norm * tgt_norm).sum(dim=1, keepdim=True)
 
-        # 组合: 主攻亮度下降(1.0)，辅攻色度一致(0.1)
-        # 这样网络就会学到: "变暗一点，但别改颜色"
-        local_loss = (loss_lum + 0.1 * loss_chroma) * final_mask
-        loss = local_loss.sum() / (valid_count + 1e-6)
+        # 最终 Loss
+        loss += 0.1 * (loss_chroma * final_mask).sum() / (valid_count + 1e-6)
 
     # ==========================================
-    # 6. Debug 可视化 (六联版 - 修复维度问题)
+    # 6. Debug 可视化
     # ==========================================
     if save_debug_path is not None:
         os.makedirs(save_debug_path, exist_ok=True)
         with torch.no_grad():
             img_src = src_albedo.detach()
-            img_tgt_raw = tgt_albedo.detach()
-            img_warp = warped_tgt_albedo.detach()
+            # 可视化 AC 分量 (加0.5变灰度，方便观察)
+            img_src_ac = torch.clamp(src_ac + 0.5, 0, 1).detach()
+            img_tgt_ac = torch.clamp(tgt_ac + 0.5, 0, 1).detach()
 
-            # --- 制作 Overlay Mask (Src + 红色高亮) ---
+            # 红色高亮 Overlay
             img_overlay = img_src.clone()
-
-            # 1. 压扁 Mask (解决 9 vs 3 通道报错)
-            # 只要 RGB 任意通道判定为高光，该像素即为高光
             if final_mask.shape[1] == 3:
                 mask_1ch = final_mask.max(dim=1, keepdim=True)[0]
             else:
                 mask_1ch = final_mask
-
-            # 2. 扩展为 3 通道用于显示
             mask_3ch = mask_1ch.repeat(1, 3, 1, 1)
+            highlight = torch.tensor([1.0, 0.0, 0.0], device=img_src.device).view(1, 3, 1, 1)
+            img_overlay = torch.where(mask_3ch > 0.5, img_src * 0.6 + highlight * 0.4, img_src)
 
-            # 3. 红色高亮
-            highlight_color = torch.tensor([1.0, 0.0, 0.0], device=img_src.device).view(1, 3, 1, 1)
-
-            img_overlay = torch.where(
-                mask_3ch > 0.5,
-                img_src * 0.6 + highlight_color * 0.4,
-                img_src
-            )
-
-            # --- Mask 通道可视化 ---
-            vis_mask = torch.zeros_like(img_src)
-
-            # R: Final Mask (真正计算 Loss 的区域)
-            vis_mask[:, 0, :, :] = mask_1ch[:, 0, :, :]
-
-            # G: Edge Mask
-            edge_vis = edge_mask if edge_mask.shape[1] == 1 else edge_mask.max(dim=1)[0].unsqueeze(1)
-            vis_mask[:, 1, :, :] = edge_vis[:, 0, :, :]
-
-            # B: Occ Mask
-            geo_vis = physics_mask if physics_mask.shape[1] == 1 else physics_mask.max(dim=1)[0].unsqueeze(1)
-            # 这里为了看物理Mask，我们显示 physics_mask 而不仅仅是 occ
-            vis_mask[:, 2, :, :] = geo_vis[:, 0, :, :]
-
-            # --- 误差热力图 ---
-            # 显示相对比率差异，越亮表示 Src 比 Tgt 亮得越多
-            diff_vis = torch.clamp(ratio_patch - 1.0, 0, 1).mean(dim=1, keepdim=True).repeat(1, 3, 1, 1) * 5.0
-
-            # --- 六图拼接 ---
-            combined = torch.cat([
-                img_src,  # 1. 当前视角
-                img_tgt_raw,  # 2. 邻居原图
-                img_warp,  # 3. 邻居Warp图
-                img_overlay,  # 4. 红色高亮惩罚区 (最重要!)
-                vis_mask,  # 5. Mask分析
-                diff_vis  # 6. 强度分析
-            ], dim=3)
-
-            file_name = os.path.join(save_debug_path, f"debug_warp_{iteration:05d}.jpg")
-            torchvision.utils.save_image(combined, file_name)
+            # [Src] [Src_AC(结构)] [Tgt_AC(结构)] [Overlay]
+            combined = torch.cat([img_src, img_src_ac, img_tgt_ac, img_overlay], dim=3)
+            torchvision.utils.save_image(combined, os.path.join(save_debug_path, f"debug_warp_{iteration:05d}.jpg"))
 
     return loss, final_mask
