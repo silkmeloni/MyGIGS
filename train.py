@@ -28,7 +28,7 @@ from utils.image_utils import psnr, turbo_cmap, erode
 from utils.loss_utils import l1_loss, ssim, get_img_grad_weight, bilateral_smoothness_loss, hsv_albedo_loss
 from utils.graphics_utils import normal_from_depth_image
 
-from utils.warp_utils import warp_consistency_loss
+from utils.warp_utils import warp_consistency_loss,material_consistency_loss
 import random
 
 import torchvision
@@ -1099,7 +1099,35 @@ def training(
                 with torch.no_grad():
                     render_pkg_tgt = render(viewpoint_tgt, gaussians, pipe, background)
 
-                # 6. 计算 Loss (传入 debug_dir 和 iteration)
+                # 整理 Source 数据
+                src_maps = {
+                    'roughness': render_pkg_src['roughness_map'],
+                    'metallic': render_pkg_src['metallic_map'],
+                    'albedo': render_pkg_src['albedo_map']
+                }
+
+                # 整理 Target 数据
+                tgt_maps = {
+                    'roughness': render_pkg_tgt['roughness_map'],
+                    'metallic': render_pkg_tgt['metallic_map'],
+                    'albedo': render_pkg_tgt['albedo_map']
+                }
+
+                # # 计算 MaterialRefGS Loss （粗糙度和金属度）
+                # loss_mat_ref_gs = material_consistency_loss(
+                #     src_maps, render_pkg_src['depth_map'], viewpoint_src,
+                #     tgt_maps, render_pkg_tgt['depth_map'], viewpoint_tgt,
+                #     constraint_albedo=False,  # 论文建议设为 False
+                #     save_debug_path=debug_dir if iteration % 100 == 0 else None,  # 每100次存一张图
+                #     iteration=iteration
+                # )
+                #
+                # # 建议权重：论文中没有明确给出 lambda_mv 的具体数值，
+                # # 但通常这种辅助 Loss 权重在 0.01 到 0.1 之间
+                # loss += args.lambda_consistency * loss_mat_ref_gs
+
+
+                # 6. 计算Albedo一致性 Loss
                 loss_consist, mask_vis = warp_consistency_loss(
                     src_albedo=render_pkg_src["albedo_map"],
                     src_depth=render_pkg_src["depth_map"],

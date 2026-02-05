@@ -127,6 +127,126 @@ def get_depth_edge_mask(depth, threshold=0.05):
     return edge_mask
 
 
+def material_consistency_loss(
+        src_maps, src_depth, src_cam,
+        tgt_maps, tgt_depth, tgt_cam,
+        constraint_albedo=False,
+        patch_size=7,
+        save_debug_path=None,  # [新增] Debug 路径
+        iteration=0  # [新增] 当前迭代次数
+):
+    """
+    MaterialRefGS 风格的多视角材质一致性约束 (带 Debug 可视化)
+    """
+
+    # 0. 辅助函数：确保 4D [N, C, H, W]
+    def ensure_4d(tensor):
+        if tensor.dim() == 3: return tensor.unsqueeze(1)
+        return tensor
+
+    # 1. 几何 Warping 准备
+    if src_depth.dim() == 4: src_depth = src_depth.squeeze(1)
+    if tgt_depth.dim() == 3: tgt_depth = tgt_depth.unsqueeze(1)
+
+    xyz_world = depth_point_to_world(src_depth, src_cam)
+    grid, projected_z = reproject_to_view(xyz_world, tgt_cam)
+    valid_grid_mask = (grid.abs().max(dim=-1)[0] < 0.99).float().unsqueeze(1)
+
+    # 2. 采样 Target
+    def warp_map(img):
+        img_4d = ensure_4d(img)
+        return F.grid_sample(img_4d, grid, align_corners=True, padding_mode='zeros')
+
+    # 键名适配
+    r_key = 'roughness_map' if 'roughness_map' in tgt_maps else 'roughness'
+    m_key = 'metallic_map' if 'metallic_map' in tgt_maps else 'metallic'
+    a_key = 'albedo_map' if 'albedo_map' in tgt_maps else 'albedo'
+
+    src_rough = ensure_4d(src_maps[r_key])
+    src_metal = ensure_4d(src_maps[m_key])
+
+    warped_roughness = warp_map(tgt_maps[r_key])
+    warped_metallic = warp_map(tgt_maps[m_key])
+    warped_tgt_depth = F.grid_sample(tgt_depth, grid, align_corners=True, padding_mode='zeros')
+
+    # 3. Mask
+    depth_bias = 0.05
+    occ_mask = (projected_z < (warped_tgt_depth + depth_bias)).float()
+    valid_mask = valid_grid_mask * occ_mask
+
+    if valid_mask.sum() < 10:
+        return torch.tensor(0.0, device=src_depth.device)
+
+    # 4. 计算 Loss
+    loss = 0.0
+
+    # Roughness
+    loss += F.mse_loss(src_rough * valid_mask, warped_roughness * valid_mask, reduction='sum') / (
+                valid_mask.sum() + 1e-6)
+    # Metallic
+    loss += F.mse_loss(src_metal * valid_mask, warped_metallic.detach() * valid_mask, reduction='sum') / (
+                valid_mask.sum() + 1e-6)
+
+    # Albedo (Optional)
+    src_albedo = None
+    warped_albedo = None
+    if constraint_albedo:
+        src_albedo = ensure_4d(src_maps[a_key])
+        warped_albedo = warp_map(tgt_maps[a_key])
+        loss += F.mse_loss(src_albedo * valid_mask, warped_albedo.detach() * valid_mask, reduction='sum') / (
+                    valid_mask.sum() + 1e-6)
+
+    # ==========================================
+    # 5. Debug 可视化 (新增模块)
+    # ==========================================
+    if save_debug_path is not None:
+        os.makedirs(save_debug_path, exist_ok=True)
+        with torch.no_grad():
+            # 辅助函数：转为3通道以便拼接
+            def to_3ch(img):
+                if img is None: return None
+                img = img.detach()
+                if img.shape[1] == 1: return img.repeat(1, 3, 1, 1)
+                return img
+
+            # 准备 Mask 可视化 (白色为有效区域)
+            vis_mask = to_3ch(valid_mask)
+
+            # --- 第一行: Roughness 分析 ---
+            row_rough = torch.cat([
+                to_3ch(src_rough),  # 1. Src Roughness
+                to_3ch(warped_roughness),  # 2. Warped Tgt Roughness (应与1一致)
+                vis_mask,  # 3. 有效 Mask (白色为计算区域)
+                to_3ch((src_rough - warped_roughness).abs() * valid_mask * 5.0)  # 4. 误差热力 (放大5倍)
+            ], dim=3)
+
+            # --- 第二行: Metallic 分析 ---
+            row_metal = torch.cat([
+                to_3ch(src_metal),
+                to_3ch(warped_metallic),
+                vis_mask,
+                to_3ch((src_metal - warped_metallic).abs() * valid_mask * 5.0)
+            ], dim=3)
+
+            # --- 组合所有行 ---
+            final_grid = torch.cat([row_rough, row_metal], dim=2)  # 垂直拼接
+
+            # --- 第三行: Albedo 分析 (如果开启) ---
+            if constraint_albedo and src_albedo is not None:
+                row_albedo = torch.cat([
+                    to_3ch(src_albedo),
+                    to_3ch(warped_albedo),
+                    vis_mask,
+                    to_3ch((src_albedo - warped_albedo).abs() * valid_mask * 5.0)
+                ], dim=3)
+                final_grid = torch.cat([final_grid, row_albedo], dim=2)
+
+            # 保存
+            file_name = os.path.join(save_debug_path, f"debug_mat_consist_{iteration:05d}.jpg")
+            torchvision.utils.save_image(final_grid, file_name)
+
+    return loss
+
 def warp_consistency_loss(
         src_albedo, src_depth, src_cam,
         tgt_albedo, tgt_depth, tgt_cam,
