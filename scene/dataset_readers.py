@@ -506,7 +506,7 @@ def readColmapSceneInfo(path: str, images: str, eval: bool, llffhold: int = 8,us
 
 
 def readCamerasFromTransforms(
-    path: str, transformsfile: str, white_background: bool, extension: str = ".png"
+    path: str, transformsfile: str, white_background: bool, extension: str = ".png",use_depth=False, use_normal=False
 ) -> List[CameraInfo]:
     print("执行了readCamerasFromTransforms")
     cam_infos = []
@@ -517,6 +517,35 @@ def readCamerasFromTransforms(
     fovx = contents["camera_angle_x"]
     frames = contents["frames"]
     for idx, frame in enumerate(frames):
+        # 1. 获取当前帧的基础路径 (例如 "train/r_0")
+        file_path = frame["file_path"]
+
+        # 2. 初始化路径变量 (默认为 None)
+        depth_mono_path = None
+        normal_mono_path = None
+
+        # 3. 寻找深度图 (仅当开关 use_depth=True 时)
+        if use_depth:
+            # 优先尝试 _disp.tiff (Blender数据集常用格式)
+            #depth_candidate = os.path.join(path, file_path + "_disp.tiff")
+            depth_candidate = os.path.join(path, file_path + "_disp.png")
+            if os.path.exists(depth_candidate):
+                depth_mono_path = depth_candidate
+                #print(f"DEBUG: 正在寻找深度图 -> {depth_candidate}")
+            else:
+                # 备选尝试 _disp.png
+                depth_candidate = os.path.join(path, file_path + "_disp.png")
+                if os.path.exists(depth_candidate):
+                    depth_mono_path = depth_candidate
+
+        # 4. 寻找法线图 (仅当开关 use_normal=True 时)
+        if use_normal:
+            # 尝试 _normal.png
+            normal_candidate = os.path.join(path, file_path + "_normal.png")
+            if os.path.exists(normal_candidate):
+                normal_mono_path = normal_candidate
+
+
         cam_name = os.path.join(path, frame["file_path"] + extension)
 
         # NeRF 'transform_matrix' is a camera-to-world transform
@@ -557,8 +586,8 @@ def readCamerasFromTransforms(
                 image_name=image_name,
                 width=image.size[0],
                 height=image.size[1],
-                depth_mono_path=None,  # <--- 传入路径
-                normal_mono_path=None
+                depth_mono_path=depth_mono_path,  # 传入变量
+                normal_mono_path=normal_mono_path,  # 传入变量
             )
         )
 
@@ -566,17 +595,14 @@ def readCamerasFromTransforms(
 
 
 def readNerfSyntheticInfo(
-    path: str, white_background: bool, eval: bool, extension: str = ".png"
+    path: str, white_background: bool, eval: bool, extension: str = ".png",use_depth=False, use_normal=False
 ) -> SceneInfo:
     print("执行了readNerfSyntheticInfo")
     print("Reading Training Transforms")
-    train_cam_infos = readCamerasFromTransforms(
-        path, "transforms_train.json", white_background, extension
-    )
-    print("Reading Test Transforms")
-    test_cam_infos = readCamerasFromTransforms(
-        path, "transforms_test.json", white_background, extension
-    )
+    train_cam_infos = readCamerasFromTransforms(path, "transforms_train.json", white_background, extension, use_depth,
+                                                use_normal)
+    test_cam_infos = readCamerasFromTransforms(path, "transforms_test.json", white_background, extension, use_depth,
+                                               use_normal)
 
     if not eval:
         train_cam_infos.extend(test_cam_infos)

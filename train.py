@@ -819,7 +819,7 @@ def training(
                         loss_omnidata = 0.0
                     else:
                         # 正常情况
-                        loss += lambda_mono_normal * loss_omnidata
+                        loss += cur_lambda_normal * loss_omnidata
 
                     # (可选) Debug
                     # if iteration % 1000 == 0:
@@ -1222,6 +1222,7 @@ def training(
                 # 2. 如果开启深度先验，往字典里加一项
                 if use_mono_depth:
                     loss_log["New_D"] = f"{loss_mono_depth_val:.{5}f}"
+                if use_mono_normal:
                     loss_log["New_N"] = f"{loss_omnidata_val:.{5}f}"
 
 
