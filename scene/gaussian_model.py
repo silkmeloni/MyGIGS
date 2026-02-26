@@ -225,6 +225,28 @@ class GaussianModel:
         optimizable_tensors = self.replace_tensor_to_optimizer(normals, "normal")
         self._normal = optimizable_tensors["normal"]
 
+    @torch.no_grad()
+    def apply_color_sabotage(self, roughness, rough_threshold=0.6, noise_level=0.1):
+        """
+        对高粗糙度（非反射）的高斯执行颜色破坏，防止漫反射颜色过拟合假高光
+        :param roughness: 形状为 [N, 1] 的 Tensor，当前高斯的粗糙度
+        :param rough_threshold: 粗糙度阈值，大于此值视为非反射高斯
+        :param noise_level: 噪声水平，默认 0.1 (+-10%)
+        """
+        # 找到 粗糙度 > threshold 的高斯掩码 (即"尚未具有反射特性"的高斯)
+        mask = (roughness > rough_threshold).squeeze()
+
+        if mask.sum() > 0:
+            # 针对您的代码结构，这里以修改 SH 的第 0 阶 (基础颜色) 为例
+            # 如果您的 PBR 代码里叫 _albedo，请将其替换为 self._albedo[mask]
+            target_color = self._features_dc[mask]
+
+            # 生成均匀分布的噪声 [-noise_level, noise_level]
+            noise = (torch.rand_like(target_color) * 2.0 - 1.0) * noise_level
+
+            # 为这些高斯的漫反射颜色叠加噪声
+            self._features_dc[mask] += noise
+
 
     @property
     def get_normal(self) -> torch.Tensor:

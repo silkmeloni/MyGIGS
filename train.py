@@ -412,6 +412,11 @@ def training(
     print("Start training...单目深度权重为",getattr(opt, "lambda_mono", 0.1) , "单目法线权重为",getattr(opt, "lambda_mono_normal", 0.1))
     print("深度先验：",use_mono_depth,"法线先验：",use_mono_normal)
 
+    # 训练循环外的初始化
+    max_specular_count = 0
+    sabotage_patience_counter = 0
+    sabotage_active = args.color_sabotage
+
     # --- 配置参数 (可以提取到 args 里) ---
     # 深度先验调度
     depth_start = 1000
@@ -665,6 +670,101 @@ def training(
                         loss_mono_depth = 0.0
                     else:
                         loss += cur_lambda_depth * loss_mono_depth
+
+                    # ==================== 论文专用插图生成模块 ====================
+                    # 每 1000 次迭代输出一次论文用图（可自行修改频率，比如 500）
+                    if iteration % 100 == 0 and valid_mask.sum() > 100:
+                        paper_dir = os.path.join(args.model_path, "paper_figures")
+                        os.makedirs(paper_dir, exist_ok=True)
+
+                        # -------------------------------------------------
+                        # 论文图 3-1：深度尺度对齐前后对比图 (散点图)
+                        # -------------------------------------------------
+                        try:
+                            import matplotlib.pyplot as plt
+
+                            # 提取掩膜内的数据，转为 Numpy 数组
+                            target_vals = render_disp[valid_mask].detach().cpu().numpy()
+                            source_vals_unaligned = mono_disp[valid_mask].detach().cpu().numpy()
+                            source_vals_aligned = aligned_mono_disp[valid_mask].detach().cpu().numpy()
+
+                            # 随机采样最多 10000 个点，避免散点图过密导致重叠黑糊
+                            sample_size = min(10000, len(target_vals))
+                            indices = np.random.choice(len(target_vals), sample_size, replace=False)
+
+                            plt.figure(figsize=(12, 5))
+
+                            # 对齐前 (Before Alignment)
+                            plt.subplot(1, 2, 1)
+                            plt.scatter(target_vals[indices], source_vals_unaligned[indices], alpha=0.3, s=2,
+                                        c='#1f77b4')
+                            ax1_min = min(target_vals[indices].min(), source_vals_unaligned[indices].min())
+                            ax1_max = max(target_vals[indices].max(), source_vals_unaligned[indices].max())
+                            plt.plot([ax1_min, ax1_max], [ax1_min, ax1_max], 'r--', label='y=x (Ideal)')
+                            plt.xlabel('3DGS Render Disparity (Target)')
+                            plt.ylabel('Depth Anything Disparity (Unaligned)')
+                            plt.title('Before Alignment')
+                            plt.legend()
+
+                            # 对齐后 (After Alignment)
+                            plt.subplot(1, 2, 2)
+                            plt.scatter(target_vals[indices], source_vals_aligned[indices], alpha=0.3, s=2,
+                                        c='#ff7f0e')
+                            ax2_min = min(target_vals[indices].min(), source_vals_aligned[indices].min())
+                            ax2_max = max(target_vals[indices].max(), source_vals_aligned[indices].max())
+                            plt.plot([ax2_min, ax2_max], [ax2_min, ax2_max], 'r--', label='y=x (Ideal)')
+                            plt.xlabel('3DGS Render Disparity (Target)')
+                            plt.ylabel('Aligned Disparity')
+                            plt.title('After Alignment (Scale & Shift)')
+                            plt.legend()
+
+                            plt.tight_layout()
+                            plt.savefig(f"{paper_dir}/iter_{iteration:05d}_alignment_scatter.png", dpi=300)
+                            plt.close()
+                        except ImportError:
+                            print("[Warn] matplotlib 未安装，无法生成深度对齐散点图，请 pip install matplotlib")
+
+                        # -------------------------------------------------
+                        # 论文图 3-2：预测差异与边缘掩膜生成过程图 (横向拼接)
+                        # -------------------------------------------------
+                        def to_color(tensor_2d, mask_2d):
+                            """将灰度的深度/视差图转为美观的 Turbo 伪彩图"""
+                            valid_vals = tensor_2d[mask_2d]
+                            if len(valid_vals) == 0:
+                                return torch.zeros((3, tensor_2d.shape[0], tensor_2d.shape[1]))
+                            # 使用分位数掐头去尾，使色彩对比度最大化
+                            vmin = torch.quantile(valid_vals, 0.05).item()
+                            vmax = torch.quantile(valid_vals, 0.95).item()
+                            norm_tensor = (tensor_2d - vmin) / (vmax - vmin + 1e-6)
+                            norm_tensor = torch.clamp(norm_tensor, 0, 1)
+                            # turbo_cmap 需要在 CPU 运算
+                            color_np = turbo_cmap(norm_tensor.cpu().numpy())  # [H, W, 3]
+                            color_th = torch.from_numpy(color_np).permute(2, 0, 1).float()
+                            return color_th * mask_2d.cpu().float()
+
+                        mask_2d = valid_mask.squeeze(0).detach()  # [H, W]
+
+                        # 1. 原始 RGB 图
+                        rgb_vis = gt_image.detach().cpu()  # [3, H, W]
+
+                        # 2. 单目预测深度 (对齐后，用于清晰展示其平滑但边缘模糊的特点)
+                        aligned_disp_vis = to_color(aligned_mono_disp.squeeze(0).detach(), mask_2d)
+
+                        # 3. 3DGS 渲染深度 (包含细碎噪声或不准的区域)
+                        render_disp_vis = to_color(render_disp.squeeze(0).detach(), mask_2d)
+
+                        # 4. 生成的边缘掩膜 (Mask / Weight)
+                        # 使用了原代码中的 edge_weight [1, H, W]
+                        weight_vis = edge_weight.squeeze(0).detach().cpu()  # [H, W]
+                        # 转成 3 通道灰度图，并只保留有效掩膜区域
+                        weight_vis = weight_vis.unsqueeze(0).repeat(3, 1, 1) * mask_2d.cpu().float()
+
+                        # 横向拼接：[ RGB | 单目伪彩 | 3DGS 渲染伪彩 | 边缘权重掩膜 ]
+                        row_img = torch.cat([rgb_vis, aligned_disp_vis, render_disp_vis, weight_vis], dim=2)
+
+                        # 保存过程图
+                        torchvision.utils.save_image(row_img, f"{paper_dir}/iter_{iteration:05d}_mask_process.png")
+                    # ==================== 论文专用插图生成模块结束 ====================
 
             # ==================== 深度与视差双重 Debug ====================
             if use_mono_depth and iteration % 100 == 0:
@@ -1189,6 +1289,20 @@ def training(
 
             # =========================================================
 
+            # # 【重点在这里】
+            # # 假设 30000 步之前是纯粹的 3DGS 几何拟合阶段
+            # # 在第 30000 步时，几何（形状和旋转）已经基本成型
+            # if iteration == 30000:
+            #     # 使用最短轴完全覆盖初始化法线
+            #     gaussians.init_normal(coe=0.0)
+            #     print("Initialized learned normals with shortest axis!")
+            #
+            # # 有些策略也会在 30000 步之后，每隔一定的步数进行一次“软混合”，防止法线跑偏
+            # elif iteration > 30000 and iteration % 1001 == 0:
+            #     # 将学习到的法线和当前的最短轴法线按比例混合（比如 0.5）
+            #     gaussians.init_normal(coe=0.0)
+
+
         loss.backward()
         # print("back")
 
@@ -1360,7 +1474,33 @@ def training(
                     light_optimizer.step()
                     light_optimizer.zero_grad(set_to_none=True)
                     cubemap.clamp_(min=0.0)
+            # ---------------- 颜色破坏策略 (Color Sabotage PBR版) ----------------
+            if sabotage_active and (iteration % args.sabotage_interval == 0):
+                # 1. 获取当前所有高斯的粗糙度
+                # 注意：这里请替换为您代码中实际获取粗糙度的方法，如 gaussians.get_roughness()
+                roughness = gaussians.get_roughness
 
+                # 2. 统计当前“反射高斯”的数量 (粗糙度 < 阈值，说明它正在拟合高光)
+                # 阈值可以稍微设低一点以确保它是真正的反射面，这里使用 1.0 - rough_thresh 作为对称概念
+                current_specular_count = (roughness < args.sabotage_rough_thresh).sum().item()
+
+                # 3. 终止条件检查：如果"反射高斯"数量还在涨，说明策略还在发掘新的反射面
+                if current_specular_count > max_specular_count:
+                    max_specular_count = current_specular_count
+                    sabotage_patience_counter = 0  # 重置耐心值
+                else:
+                    sabotage_patience_counter += 1
+
+                if sabotage_patience_counter >= args.sabotage_patience:
+                    print(f"[Iteration {iteration}] 颜色破坏策略终止：低粗糙度(反射)高斯数量稳定。")
+                    sabotage_active = False
+                else:
+                    # 4. 执行颜色破坏：打乱那些高粗糙度高斯的颜色，逼迫网络用粗糙度/法线去拟合高光
+                    gaussians.apply_color_sabotage(
+                        roughness,
+                        rough_threshold=args.sabotage_rough_thresh,
+                        noise_level=args.sabotage_noise
+                    )
         
         # time.sleep(0.15)
         torch.cuda.empty_cache()
@@ -1634,9 +1774,29 @@ def training_report(
                 l1_test /= len(config["cameras"])
                 lpips_test /= len(config["cameras"])
                 print(len(config["cameras"]))
-                print(
-                    f"\n[ITER {iteration}] Evaluating {config['name']}: L1 {l1_test:.6f} PSNR {psnr_test:.6f} SSIM {ssim_test:.6f} LPIPS {lpips_test:.6f}"
-                )
+                # print(
+                #     f"\n[ITER {iteration}] Evaluating {config['name']}: L1 {l1_test:.6f} PSNR {psnr_test:.6f} SSIM {ssim_test:.6f} LPIPS {lpips_test:.6f}"
+                # )
+
+                # --- 修改开始：写入指标和运行命令 ---
+                # 1. 准备评估结果字符串
+                eval_log = f"\n[ITER {iteration}] Evaluating {config['name']}: L1 {l1_test:.6f} PSNR {psnr_test:.6f} SSIM {ssim_test:.6f} LPIPS {lpips_test:.6f}"
+                print(eval_log)  # 打印到控制台
+
+                # 2. 获取当前运行的完整命令
+                # sys.argv 包含了脚本名和所有参数，我们用空格连接起来
+                current_cmd = "python " + " ".join(sys.argv)
+
+                # 3. 写入 metrics.txt
+                metrics_filepath = os.path.join(scene.model_path, "metrics.txt")
+                with open(metrics_filepath, "a") as f:
+                    f.write(eval_log)
+                    f.write(f"\n[Command] {current_cmd}\n")  # 写入命令
+                    f.write("-" * 50)  # 添加分割线，方便区分多次评估
+
+                print(f"[INFO] Metrics and command saved to {metrics_filepath}")
+                # --- 修改结束 ---
+
                 if tb_writer:
                     tb_writer.add_scalar(
                         config["name"] + "/loss_viewpoint - l1_loss", l1_test, iteration
@@ -1726,6 +1886,15 @@ if __name__ == "__main__":
                         help="Switch to enable light optimization/regularization module")
     # 权重参数
     parser.add_argument("--lambda_light", type=float, default=0.01, help="Weight for light regularization")
+
+    # 在您的 OptimizationParams 类或 argparse 设置中添加：
+    # 颜色破坏策略 (Color Sabotage) 专用参数
+    parser.add_argument("--color_sabotage", action="store_true", help="是否启用基于粗糙度的颜色破坏策略")
+    parser.add_argument("--sabotage_interval", type=int, default=100, help="执行颜色破坏的迭代间隔")
+    parser.add_argument("--sabotage_noise", type=float, default=0.1, help="加入的基础颜色噪声比例 (+-10%)")
+    # PBR 适配：粗糙度大于此值被视为“尚未成为反射体”的高斯
+    parser.add_argument("--sabotage_rough_thresh", type=float, default=0.6, help="执行颜色破坏的粗糙度下限")
+    parser.add_argument("--sabotage_patience", type=int, default=5, help="当反射高斯数量不再增加时终止策略的容忍次数")
 
     args = parser.parse_args(sys.argv[1:])
     args.test_iterations.append(args.iterations)
