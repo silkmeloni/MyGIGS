@@ -681,45 +681,82 @@ def training(
                         # 论文图 3-1：深度尺度对齐前后对比图 (散点图)
                         # -------------------------------------------------
                         try:
+                            import matplotlib
+                            matplotlib.use('Agg')  # 强制使用无头后端，彻底绕过 Linux 报错
                             import matplotlib.pyplot as plt
+                            import matplotlib.font_manager as fm
+                            import scipy.stats as stats
+
+                            # 挂载我们刚刚测试成功的黑体
+                            current_dir = os.path.dirname(os.path.abspath(__file__))
+                            simhei_path = os.path.join(current_dir, 'simsun.ttc')
+
+                            if not os.path.exists(simhei_path):
+                                print(f"[Warn] 找不到 {simhei_path}，中文可能显示异常！")
+                                zh_font = fm.FontProperties(size=12)
+                                zh_font_title = fm.FontProperties(size=14)
+                            else:
+                                zh_font = fm.FontProperties(fname=simhei_path, size=12)
+                                zh_font_title = fm.FontProperties(fname=simhei_path, size=14)
+
+                            plt.rcParams['axes.unicode_minus'] = False  # 正常显示负号
 
                             # 提取掩膜内的数据，转为 Numpy 数组
                             target_vals = render_disp[valid_mask].detach().cpu().numpy()
                             source_vals_unaligned = mono_disp[valid_mask].detach().cpu().numpy()
                             source_vals_aligned = aligned_mono_disp[valid_mask].detach().cpu().numpy()
 
-                            # 随机采样最多 10000 个点，避免散点图过密导致重叠黑糊
+                            # 随机采样最多 10000 个点避免画图过慢和重叠
                             sample_size = min(10000, len(target_vals))
                             indices = np.random.choice(len(target_vals), sample_size, replace=False)
 
-                            plt.figure(figsize=(12, 5))
+                            # 计算量化指标 RMSE
+                            rmse_unaligned = np.sqrt(np.mean((source_vals_unaligned - target_vals) ** 2))
+                            rmse_aligned = np.sqrt(np.mean((source_vals_aligned - target_vals) ** 2))
 
-                            # 对齐前 (Before Alignment)
-                            plt.subplot(1, 2, 1)
+                            plt.figure(figsize=(18, 5))
+
+                            # 子图 1：对齐前
+                            plt.subplot(1, 3, 1)
                             plt.scatter(target_vals[indices], source_vals_unaligned[indices], alpha=0.3, s=2,
                                         c='#1f77b4')
-                            ax1_min = min(target_vals[indices].min(), source_vals_unaligned[indices].min())
-                            ax1_max = max(target_vals[indices].max(), source_vals_unaligned[indices].max())
-                            plt.plot([ax1_min, ax1_max], [ax1_min, ax1_max], 'r--', label='y=x (Ideal)')
-                            plt.xlabel('3DGS Render Disparity (Target)')
-                            plt.ylabel('Depth Anything Disparity (Unaligned)')
-                            plt.title('Before Alignment')
-                            plt.legend()
+                            ax_min, ax_max = target_vals[indices].min(), target_vals[indices].max()
+                            plt.plot([ax_min, ax_max], [ax_min, ax_max], 'r--', label='y=x (理想)')
+                            plt.xlabel('3DGS 渲染视差 (目标值)', fontproperties=zh_font)
+                            plt.ylabel('预测视差 (未对齐)', fontproperties=zh_font)
+                            plt.title(f'对齐前 (RMSE: {rmse_unaligned:.2f})', fontproperties=zh_font_title)
+                            plt.legend(prop=zh_font)
 
-                            # 对齐后 (After Alignment)
-                            plt.subplot(1, 2, 2)
-                            plt.scatter(target_vals[indices], source_vals_aligned[indices], alpha=0.3, s=2,
-                                        c='#ff7f0e')
-                            ax2_min = min(target_vals[indices].min(), source_vals_aligned[indices].min())
-                            ax2_max = max(target_vals[indices].max(), source_vals_aligned[indices].max())
-                            plt.plot([ax2_min, ax2_max], [ax2_min, ax2_max], 'r--', label='y=x (Ideal)')
-                            plt.xlabel('3DGS Render Disparity (Target)')
-                            plt.ylabel('Aligned Disparity')
-                            plt.title('After Alignment (Scale & Shift)')
-                            plt.legend()
+                            # 子图 2：对齐后
+                            plt.subplot(1, 3, 2)
+                            plt.scatter(target_vals[indices], source_vals_aligned[indices], alpha=0.3, s=2, c='#ff7f0e')
+                            plt.plot([ax_min, ax_max], [ax_min, ax_max], 'r--', label='y=x (理想)')
+                            plt.xlabel('3DGS 渲染视差 (目标值)', fontproperties=zh_font)
+                            plt.ylabel('预测视差 (对齐后)', fontproperties=zh_font)
+                            plt.title(f'对齐后 (RMSE: {rmse_aligned:.2f})', fontproperties=zh_font_title)
+                            plt.legend(prop=zh_font)
+
+                            # 子图 3：误差分布直方图
+                            plt.subplot(1, 3, 3)
+                            error_unaligned = source_vals_unaligned - target_vals
+                            error_aligned = source_vals_aligned - target_vals
+
+                            hist_min = np.percentile(error_unaligned, 5)
+                            hist_max = np.percentile(error_unaligned, 95)
+                            bins = np.linspace(hist_min, hist_max, 50)
+
+                            plt.hist(error_unaligned, bins=bins, alpha=0.5, label='对齐前误差', color='#1f77b4',
+                                     density=True)
+                            plt.hist(error_aligned, bins=bins, alpha=0.5, label='对齐后误差', color='#ff7f0e',
+                                     density=True)
+                            plt.axvline(x=0, color='r', linestyle='--')
+                            plt.xlabel('绝对误差 (预测值 - 目标值)', fontproperties=zh_font)
+                            plt.ylabel('密度', fontproperties=zh_font)
+                            plt.title('对齐前后残差分布对比', fontproperties=zh_font_title)
+                            plt.legend(prop=zh_font)
 
                             plt.tight_layout()
-                            plt.savefig(f"{paper_dir}/iter_{iteration:05d}_alignment_scatter.png", dpi=300)
+                            plt.savefig(f"{paper_dir}/iter_{iteration:05d}_alignment_analysis.png", dpi=300)
                             plt.close()
                         except ImportError:
                             print("[Warn] matplotlib 未安装，无法生成深度对齐散点图，请 pip install matplotlib")
