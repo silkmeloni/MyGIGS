@@ -103,6 +103,7 @@ class OptimizationParams(ParamGroup):
         self.lambda_mono = 0.1  # 这里的默认值通常给 0，表示默认关闭
         self.lambda_mono_normal = 0.1  # 这里的默认值通常给 0，表示默认关闭
 
+
         self.depth_loss_type = 'complex'
 
         super().__init__(parser, "Optimization Parameters")

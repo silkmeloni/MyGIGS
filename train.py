@@ -672,8 +672,8 @@ def training(
                         loss += cur_lambda_depth * loss_mono_depth
 
                     # ==================== 论文专用插图生成模块 ====================
-                    # 每 1000 次迭代输出一次论文用图（可自行修改频率，比如 500）
-                    if iteration % 100 == 0 and valid_mask.sum() > 100:
+                    # 每 500 次迭代输出一次论文用图（可自行修改频率，比如 500）
+                    if iteration % 500 == 0 and valid_mask.sum() > 100:
                         paper_dir = os.path.join(args.model_path, "paper_figures")
                         os.makedirs(paper_dir, exist_ok=True)
 
@@ -804,7 +804,7 @@ def training(
                     # ==================== 论文专用插图生成模块结束 ====================
 
             # ==================== 深度与视差双重 Debug ====================
-            if use_mono_depth and iteration % 100 == 0:
+            if use_mono_depth and iteration % 500 == 0:
                 # 1. 创建两个文件夹
                 dir_disp = os.path.join(args.model_path, "debug_disparity")
                 dir_depth = os.path.join(args.model_path, "debug_metric_depth")
@@ -963,7 +963,7 @@ def training(
                     #     print(f"Normal Consistency Kept: {Mn.sum()/gt_alpha_mask.sum():.2%}")
 
             # ==================== 法线对比 Debug====================
-            if use_mono_normal and iteration % 100 == 0:
+            if use_mono_normal and iteration % 500 == 0:
                 if hasattr(viewpoint_cam, 'mono_normal_image') and viewpoint_cam.mono_normal_image is not None:
 
                     debug_dir = os.path.join(args.model_path, "debug_normals")
@@ -1339,6 +1339,29 @@ def training(
             #     # 将学习到的法线和当前的最短轴法线按比例混合（比如 0.5）
             #     gaussians.init_normal(coe=0.0)
 
+        #在这下面写的不管stage1还是stage2都生效
+        # ==========================================================
+        # [新增] 尺度正则化 (Anisotropic Scale Penalty)
+        # ==========================================================
+        if args.lambda_scale_reg > 0.0:
+            scales = gaussians.get_scaling  # 获取所有高斯的真实尺度参数 [N, 3]
+
+            # 找到每个高斯的最长轴和最短轴
+            max_scales = torch.max(scales, dim=1).values
+            min_scales = torch.min(scales, dim=1).values
+
+            # 计算各向异性比例 (长轴 / 短轴)
+            # 加上 1e-7 防止除以零导致 NaN
+            scale_ratio = max_scales / (min_scales + 1e-7)
+
+            # 使用 ReLU 设定一个阈值（Margin）
+            # 我们允许高斯变成椭球，但不允许极端的形变（比例 > 10.0）
+            # 只有比例超过 10.0 的高斯才会产生 Loss 惩罚
+            scale_loss = torch.mean(torch.nn.functional.relu(scale_ratio - 10.0))
+
+            # 将正则化 Loss 加入总 Loss
+            loss = loss + args.lambda_scale_reg * scale_loss
+        # ==========================================================
 
         loss.backward()
         # print("back")
@@ -1932,6 +1955,9 @@ if __name__ == "__main__":
     # PBR 适配：粗糙度大于此值被视为“尚未成为反射体”的高斯
     parser.add_argument("--sabotage_rough_thresh", type=float, default=0.6, help="执行颜色破坏的粗糙度下限")
     parser.add_argument("--sabotage_patience", type=int, default=5, help="当反射高斯数量不再增加时终止策略的容忍次数")
+    #尺度正则化
+    parser.add_argument("--lambda_scale_reg", type=float, default=0.0,
+                        help="Weight for anisotropic scale penalty (0.0 to disable)")
 
     args = parser.parse_args(sys.argv[1:])
     args.test_iterations.append(args.iterations)
@@ -1975,6 +2001,7 @@ if __name__ == "__main__":
         indirect=args.indirect,
         # 【新增】接收位置约束参数
         use_position_opt=args.use_position_opt,
+
     )
 
     # All done
