@@ -186,9 +186,13 @@ def material_consistency_loss(
         if tensor.dim() == 3: return tensor.unsqueeze(1)
         return tensor
 
+    # 【必须添加这一行！】彻底切断几何梯度
+    src_depth = src_depth.detach()
+
     # 1. 几何 Warping 准备
     if src_depth.dim() == 4: src_depth = src_depth.squeeze(1)
     if tgt_depth.dim() == 3: tgt_depth = tgt_depth.unsqueeze(1)
+
 
     xyz_world = depth_point_to_world(src_depth, src_cam)
     grid, projected_z = reproject_to_view(xyz_world, tgt_cam)
@@ -217,8 +221,15 @@ def material_consistency_loss(
     # [新增] 计算法线朝向掩码
     facing_mask = get_normal_facing_mask(xyz_world, src_normal, tgt_cam, threshold=0.05)
 
-    # 最终掩码 = 在屏幕内 * 未被遮挡 * 且面向 Target 相机
-    valid_mask = valid_grid_mask * occ_mask * facing_mask
+    # 在计算 valid_mask 之前，加上深度边缘检测
+    dy = torch.abs(src_depth[..., 1:, :] - src_depth[..., :-1, :])
+    dx = torch.abs(src_depth[..., :, 1:] - src_depth[..., :, :-1])
+    dy = F.pad(dy, (0, 0, 0, 1))
+    dx = F.pad(dx, (0, 1, 0, 0))
+    edge_mask = ((dy + dx) < 0.08).float()  # 剔除深度突变区域
+
+    # 将 edge_mask 加到最终的 valid_mask 里
+    valid_mask = valid_grid_mask * occ_mask * facing_mask * edge_mask
 
     if valid_mask.sum() < 10:
         return torch.tensor(0.0, device=src_depth.device)

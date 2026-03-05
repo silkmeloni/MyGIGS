@@ -171,8 +171,8 @@ def render_normal(viewpoint_cam, depth, offset=None, normal=None, scale=1):
     st = max(int(scale/2)-1,0)
     if offset is not None:
         offset = offset[st::scale,st::scale]
-    normal_ref = normal_from_depth_image(depth[st::scale,st::scale], 
-                                            intrinsic_matrix.to(depth.device), 
+    normal_ref = normal_from_depth_image(depth[st::scale,st::scale],
+                                            intrinsic_matrix.to(depth.device),
                                             extrinsic_matrix.to(depth.device), offset)
 
     normal_ref = normal_ref.permute(2,0,1)
@@ -182,7 +182,7 @@ def render_normal(viewpoint_cam, depth, offset=None, normal=None, scale=1):
 def linear_to_srgb(linear: Union[np.ndarray, torch.Tensor]) -> Union[np.ndarray, torch.Tensor]:
     if isinstance(linear, torch.Tensor):
         """Assumes `linear` is in [0, 1], see https://en.wikipedia.org/wiki/SRGB."""
-        eps = torch.finfo(torch.float32).eps 
+        eps = torch.finfo(torch.float32).eps
         srgb0 = 323 / 25 * linear
         srgb1 = (211 * torch.clamp(linear, min=eps) ** (5 / 12) - 11) / 200
         # srgb1 = 1.055 * torch.pow(torch.clamp(linear, min=eps), 1.0/2.4) - 0.055
@@ -194,7 +194,7 @@ def linear_to_srgb(linear: Union[np.ndarray, torch.Tensor]) -> Union[np.ndarray,
         return np.where(linear <= 0.0031308, srgb0, srgb1)
     else:
         raise NotImplementedError
-    
+
 def srgb_to_linear(srgb: Union[np.ndarray, torch.Tensor]) -> Union[np.ndarray, torch.Tensor]:
     if isinstance(srgb, torch.Tensor):
         """Assumes `linear` is in [0, 1], see https://en.wikipedia.org/wiki/SRGB."""
@@ -207,7 +207,7 @@ def srgb_to_linear(srgb: Union[np.ndarray, torch.Tensor]) -> Union[np.ndarray, t
         return np.where(srgb <= 0.04045, linear0, linear1)
     else:
         raise NotImplementedError
-    
+
 def get_tv_loss(
     gt_image: torch.Tensor,  # [3, H, W]
     prediction: torch.Tensor,  # [C, H, W]
@@ -481,7 +481,7 @@ def training(
         pipe.debug
 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
-       
+
         if iteration <= pbr_iteration:
             background = bg
         else:  # NOTE: black background for PBR
@@ -1100,7 +1100,7 @@ def training(
             else:
                 F0 = torch.ones_like(albedo_map) * 0.04  # [1, H, W, 3]
                 metallic_map = torch.zeros_like(roughness_map)
-        
+
             linear_rgb = srgb_to_linear(render_direct)
 
             (IRR, _) = SSR(out_normal_view.detach(), depth_pos.detach(), linear_rgb.detach(), albedo_map, roughness_map, metallic_map, F0)
@@ -1171,7 +1171,7 @@ def training(
             # ==================================================================
             # [New Feature] 多视角一致性 (Optimized + Debug Version)
             # ==================================================================
-            if args.use_consistency and args.lambda_consistency > 0 and iteration > 32000 and (iteration % 5 == 0):
+            if args.use_consistency and args.lambda_consistency > 0 and iteration > 32000 :#and (iteration % 5 == 0):
 
                 # 1. 变量名适配 (把主循环的渲染结果拿过来复用)
                 # 请根据你之前的报错，确认这里是 rendering_result 还是 render_pkg
@@ -1262,6 +1262,7 @@ def training(
                 # 建议权重：论文中没有明确给出 lambda_mv 的具体数值，
                 # 但通常这种辅助 Loss 权重在 0.01 到 0.1 之间
                 loss += args.lambda_consistency * loss_mat_ref_gs
+                loss_consist = loss_mat_ref_gs
 
 
                 # 6. 计算Albedo一致性 Loss
@@ -1437,6 +1438,9 @@ def training(
                     # 记录单目深度监督 Loss (如果开启)
                     if use_mono_depth:
                         tb_writer.add_scalar('train_loss_patches/mono_depth_loss', loss_mono_depth_val, iteration)
+
+                    if args.use_consistency and iteration > pbr_iteration:
+                        tb_writer.add_scalar('train_loss_patches/consist_loss', loss_consist.item(), iteration)
                 #==========================================
 
             if iteration in saving_iterations:
@@ -1561,7 +1565,7 @@ def training(
                         rough_threshold=args.sabotage_rough_thresh,
                         noise_level=args.sabotage_noise
                     )
-        
+
         # time.sleep(0.15)
         torch.cuda.empty_cache()
 
@@ -1657,7 +1661,7 @@ def training_report(
                         delta=delta,
                         step=step,
                         start=start)
-                    
+
                     tanfovx = math.tan(viewpoint.FoVx * 0.5)
                     tanfovy = math.tan(viewpoint.FoVy * 0.5)
                     image_height=int(viewpoint.image_height)
@@ -1728,7 +1732,7 @@ def training_report(
                             brdf_lut=brdf_lut,
                             occlusion=occlusion
                         )
-                        
+
                         diffuse_rgb = (
                             pbr_result["diffuse_rgb"].clamp(min=0.0, max=1.0).permute(2, 0, 1)
                         )  # [3, H, W]
@@ -1753,7 +1757,7 @@ def training_report(
 
                         # linear_rgb = (
                         #     pbr_result["linear_rgb"].permute(2, 0, 1)
-                        # ) 
+                        # )
 
                         # linear_rgb = torch.where(
                         #     normal_mask,
@@ -2005,4 +2009,3 @@ if __name__ == "__main__":
     )
 
     # All done
-   

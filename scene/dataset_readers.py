@@ -550,7 +550,7 @@ def readCamerasFromTransforms(
             # else:
             #     normal_mono_path = os.path.join(path, file_path + " /normal.png")
         #print("path:",path) #lego
-        print(normal_mono_path)
+        #print(normal_mono_path)
 
         cam_name = os.path.join(path, frame["file_path"] + extension)
 
