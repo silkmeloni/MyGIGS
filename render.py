@@ -270,7 +270,7 @@ def render_set(
             bg_normal = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float32, device="cuda")
             normal_map = normal_map * alpha_mask + bg_normal[:, None, None] * (1.0 - alpha_mask)
             # 绝对不能 clamp 到 0~1，保持它在 [-1, 1] 的范围！
-            
+
             diffuse_rgb = (diffuse_rgb * alpha_mask + background[:, None, None] * (1.0 - alpha_mask)).clamp(0.0, 1.0)
             specular_rgb = (specular_rgb * alpha_mask + background[:, None, None] * (1.0 - alpha_mask)).clamp(0.0, 1.0)
 

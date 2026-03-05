@@ -1171,7 +1171,7 @@ def training(
             # ==================================================================
             # [New Feature] 多视角一致性 (Optimized + Debug Version)
             # ==================================================================
-            if args.use_consistency and args.lambda_consistency > 0 and iteration > 3200 and (iteration % 5 == 0):
+            if args.use_consistency and args.lambda_consistency > 0 and iteration > 32000 and (iteration % 5 == 0):
 
                 # 1. 变量名适配 (把主循环的渲染结果拿过来复用)
                 # 请根据你之前的报错，确认这里是 rendering_result 还是 render_pkg
@@ -1250,31 +1250,31 @@ def training(
                     'albedo': render_pkg_tgt['albedo_map']
                 }
 
-                # # 计算 MaterialRefGS Loss （粗糙度和金属度）
-                # loss_mat_ref_gs = material_consistency_loss(
-                #     src_maps, render_pkg_src['depth_map'], viewpoint_src,
-                #     tgt_maps, render_pkg_tgt['depth_map'], viewpoint_tgt,
-                #     constraint_albedo=False,  # 论文建议设为 False
-                #     save_debug_path=debug_dir if iteration % 100 == 0 else None,  # 每100次存一张图
-                #     iteration=iteration
-                # )
-                #
-                # # 建议权重：论文中没有明确给出 lambda_mv 的具体数值，
-                # # 但通常这种辅助 Loss 权重在 0.01 到 0.1 之间
-                # loss += args.lambda_consistency * loss_mat_ref_gs
+                # # 计算粗糙度和金属度一致性Loss
+                loss_mat_ref_gs = material_consistency_loss(
+                    src_maps, render_pkg_src['depth_map'], viewpoint_src,
+                    tgt_maps, render_pkg_tgt['depth_map'], viewpoint_tgt,
+                    constraint_albedo=False,  # 论文建议设为 False
+                    save_debug_path=debug_dir if iteration % 100 == 0 else None,  # 每100次存一张图
+                    iteration=iteration
+                )
+
+                # 建议权重：论文中没有明确给出 lambda_mv 的具体数值，
+                # 但通常这种辅助 Loss 权重在 0.01 到 0.1 之间
+                loss += args.lambda_consistency * loss_mat_ref_gs
 
 
                 # 6. 计算Albedo一致性 Loss
-                loss_consist, mask_vis = warp_consistency_loss(
-                    src_albedo=render_pkg_src["albedo_map"],
-                    src_depth=render_pkg_src["depth_map"],
-                    src_cam=viewpoint_src,
-                    tgt_albedo=render_pkg_tgt["albedo_map"],
-                    tgt_depth=render_pkg_tgt["depth_map"],
-                    tgt_cam=viewpoint_tgt,
-                    save_debug_path=debug_dir,  # 【关键】传入路径
-                    iteration=iteration  # 【关键】传入迭代次数
-                )
+                # loss_consist, mask_vis = warp_consistency_loss(
+                #     src_albedo=render_pkg_src["albedo_map"],
+                #     src_depth=render_pkg_src["depth_map"],
+                #     src_cam=viewpoint_src,
+                #     tgt_albedo=render_pkg_tgt["albedo_map"],
+                #     tgt_depth=render_pkg_tgt["depth_map"],
+                #     tgt_cam=viewpoint_tgt,
+                #     save_debug_path=debug_dir,  # 【关键】传入路径
+                #     iteration=iteration  # 【关键】传入迭代次数
+                # )
 
                 loss += loss_consist * args.lambda_consistency
 

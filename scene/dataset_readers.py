@@ -518,7 +518,7 @@ def readCamerasFromTransforms(
     frames = contents["frames"]
     for idx, frame in enumerate(frames):
         # 1. 获取当前帧的基础路径 (例如 "train/r_0")
-        file_path = frame["file_path"]
+        file_path = frame["file_path"]  # 此时是 "./test_199/rgba"
 
         # 2. 初始化路径变量 (默认为 None)
         depth_mono_path = None
@@ -541,10 +541,16 @@ def readCamerasFromTransforms(
         # 4. 寻找法线图 (仅当开关 use_normal=True 时)
         if use_normal:
             # 尝试 _normal.png
-            normal_candidate = os.path.join(path, file_path + "_normal.png")
-            if os.path.exists(normal_candidate):
-                normal_mono_path = normal_candidate
-
+            normal_path = file_path.replace("rgba", "normal.png")
+            normal_mono_path = os.path.join(path, normal_path)
+            # normal_candidate = os.path.join(path, file_path + "_normal.png")
+            # #print("候选为:",normal_candidate)
+            # if os.path.exists(normal_candidate):
+            #     normal_mono_path = normal_candidate
+            # else:
+            #     normal_mono_path = os.path.join(path, file_path + " /normal.png")
+        #print("path:",path) #lego
+        print(normal_mono_path)
 
         cam_name = os.path.join(path, frame["file_path"] + extension)
 

@@ -127,13 +127,55 @@ def get_depth_edge_mask(depth, threshold=0.05):
     return edge_mask
 
 
+def get_normal_facing_mask(xyz_world, src_normal, tgt_cam, threshold=0.05):
+    """
+    计算法线朝向掩码，剔除在 Target 视角下背向相机的点。
+    xyz_world: [B, 3, H, W] 世界坐标系下的 3D 点
+    src_normal: [B, 3, H, W] Source 视角渲染出的世界坐标系法线
+    tgt_cam: Target 视角的 3DGS Camera 对象
+    threshold: 阈值，大于此值才认为是有效面向相机 (0.05 可过滤极端的边缘侧切面)
+    """
+    if src_normal is None:
+        # 如果未传入法线，返回全 1 的 fallback mask
+        return torch.ones((xyz_world.shape[0], 1, xyz_world.shape[2], xyz_world.shape[3]), device=xyz_world.device)
+
+    # 确保 normal 是 4D
+    if src_normal.dim() == 3:
+        src_normal = src_normal.unsqueeze(0)
+
+    # 1. 获取 Target 相机在世界坐标系下的中心位置
+    # 3DGS 的 camera 对象通常自带 camera_center 属性
+    if hasattr(tgt_cam, 'camera_center'):
+        cam_pos = tgt_cam.camera_center.view(1, 3, 1, 1).to(xyz_world.device)
+    else:
+        # Fallback: 通过 w2c 矩阵求逆得到相机世界坐标
+        w2c = tgt_cam.world_view_transform.transpose(0, 1)  # [4, 4]
+        c2w = torch.inverse(w2c)
+        cam_pos = c2w[:3, 3].view(1, 3, 1, 1).to(xyz_world.device)
+
+    # 2. 计算从表面点指向 Target 相机的视线方向 (View Direction)
+    view_dir = cam_pos - xyz_world
+    view_dir = F.normalize(view_dir, dim=1)  # [B, 3, H, W]
+
+    # 3. 确保法线被归一化
+    normal_norm = F.normalize(src_normal, dim=1)
+
+    # 4. 计算点乘 (Dot Product)
+    dot_prod = (normal_norm * view_dir).sum(dim=1, keepdim=True)  # [B, 1, H, W]
+
+    # 5. 大于 threshold 表示面向相机
+    facing_mask = (dot_prod > threshold).float()
+
+    return facing_mask
+
 def material_consistency_loss(
         src_maps, src_depth, src_cam,
         tgt_maps, tgt_depth, tgt_cam,
+        src_normal=None,         # [新增] Source 视角的法线图
         constraint_albedo=False,
         patch_size=7,
-        save_debug_path=None,  # [新增] Debug 路径
-        iteration=0  # [新增] 当前迭代次数
+        save_debug_path=None,
+        iteration=0
 ):
     """
     MaterialRefGS 风格的多视角材质一致性约束 (带 Debug 可视化)
@@ -172,7 +214,11 @@ def material_consistency_loss(
     # 3. Mask
     depth_bias = 0.05
     occ_mask = (projected_z < (warped_tgt_depth + depth_bias)).float()
-    valid_mask = valid_grid_mask * occ_mask
+    # [新增] 计算法线朝向掩码
+    facing_mask = get_normal_facing_mask(xyz_world, src_normal, tgt_cam, threshold=0.05)
+
+    # 最终掩码 = 在屏幕内 * 未被遮挡 * 且面向 Target 相机
+    valid_mask = valid_grid_mask * occ_mask * facing_mask
 
     if valid_mask.sum() < 10:
         return torch.tensor(0.0, device=src_depth.device)
@@ -181,7 +227,7 @@ def material_consistency_loss(
     loss = 0.0
 
     # Roughness
-    loss += F.mse_loss(src_rough * valid_mask, warped_roughness * valid_mask, reduction='sum') / (
+    loss += F.mse_loss(src_rough * valid_mask, warped_roughness.detach() * valid_mask, reduction='sum') / (
                 valid_mask.sum() + 1e-6)
     # Metallic
     loss += F.mse_loss(src_metal * valid_mask, warped_metallic.detach() * valid_mask, reduction='sum') / (
@@ -250,6 +296,7 @@ def material_consistency_loss(
 def warp_consistency_loss(
         src_albedo, src_depth, src_cam,
         tgt_albedo, tgt_depth, tgt_cam,
+        src_normal=None,         # [新增] Source 视角的法线图
         save_debug_path=None,
         iteration=0,
         margin=0.03,
@@ -296,7 +343,11 @@ def warp_consistency_loss(
     dx = F.pad(dx, (0, 1, 0, 0))
     edge_mask = ((dy + dx) < 0.08).float()
 
-    physics_mask = valid_grid_mask * occ_mask * edge_mask
+    # [新增] 计算法线朝向掩码
+    facing_mask = get_normal_facing_mask(xyz_world, src_normal, tgt_cam, threshold=0.05)
+
+    # 乘以 facing_mask 剔除背向面
+    physics_mask = valid_grid_mask * occ_mask * edge_mask * facing_mask
 
     # ==========================================
     # [核心修正] 零均值 (Zero-Mean) 分解
