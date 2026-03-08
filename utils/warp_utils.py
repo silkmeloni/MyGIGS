@@ -168,10 +168,11 @@ def get_normal_facing_mask(xyz_world, src_normal, tgt_cam, threshold=0.05):
 
     return facing_mask
 
+
 def material_consistency_loss(
         src_maps, src_depth, src_cam,
         tgt_maps, tgt_depth, tgt_cam,
-        src_normal=None,         # [新增] Source 视角的法线图
+        src_normal=None,  # [新增] Source 视角的法线图
         constraint_albedo=False,
         patch_size=7,
         save_debug_path=None,
@@ -179,6 +180,7 @@ def material_consistency_loss(
 ):
     """
     MaterialRefGS 风格的多视角材质一致性约束 (带 Debug 可视化)
+    已修改: 使用 L1 Loss 替代 MSE Loss，保持材质边界锐利
     """
 
     # 0. 辅助函数：确保 4D [N, C, H, W]
@@ -192,7 +194,6 @@ def material_consistency_loss(
     # 1. 几何 Warping 准备
     if src_depth.dim() == 4: src_depth = src_depth.squeeze(1)
     if tgt_depth.dim() == 3: tgt_depth = tgt_depth.unsqueeze(1)
-
 
     xyz_world = depth_point_to_world(src_depth, src_cam)
     grid, projected_z = reproject_to_view(xyz_world, tgt_cam)
@@ -216,45 +217,50 @@ def material_consistency_loss(
     warped_tgt_depth = F.grid_sample(tgt_depth, grid, align_corners=True, padding_mode='zeros')
 
     # 3. Mask
-    depth_bias = 0.05
-    occ_mask = (projected_z < (warped_tgt_depth + depth_bias)).float()
     # [新增] 计算法线朝向掩码
     facing_mask = get_normal_facing_mask(xyz_world, src_normal, tgt_cam, threshold=0.05)
 
-    # 在计算 valid_mask 之前，加上深度边缘检测
+    # 极度严苛的边缘剔除 (0.02 - 0.03)
     dy = torch.abs(src_depth[..., 1:, :] - src_depth[..., :-1, :])
     dx = torch.abs(src_depth[..., :, 1:] - src_depth[..., :, :-1])
     dy = F.pad(dy, (0, 0, 0, 1))
     dx = F.pad(dx, (0, 1, 0, 0))
-    edge_mask = ((dy + dx) < 0.08).float()  # 剔除深度突变区域
+    edge_mask = ((dy + dx) < 0.02).float()  # 剔除任何深度稍微不平滑的地方
+    depth_bias = 0.02  # 深度遮挡阈值收紧，从之前的 0.05 改为 0.02
+    occ_mask = (projected_z < (warped_tgt_depth + depth_bias)).float()
 
     # 将 edge_mask 加到最终的 valid_mask 里
     valid_mask = valid_grid_mask * occ_mask * facing_mask * edge_mask
 
+    # 【非常重要】确保 mask 本身不传回梯度
+    valid_mask = valid_mask.detach()
+
     if valid_mask.sum() < 10:
         return torch.tensor(0.0, device=src_depth.device)
 
-    # 4. 计算 Loss
+    # ==========================================
+    # 4. 计算 Loss (已全部替换为 L1 Loss)
+    # ==========================================
     loss = 0.0
 
-    # Roughness
-    loss += F.mse_loss(src_rough * valid_mask, warped_roughness.detach() * valid_mask, reduction='sum') / (
-                valid_mask.sum() + 1e-6)
-    # Metallic
-    loss += F.mse_loss(src_metal * valid_mask, warped_metallic.detach() * valid_mask, reduction='sum') / (
-                valid_mask.sum() + 1e-6)
+    # Roughness (L1)
+    loss += F.l1_loss(src_rough * valid_mask, warped_roughness.detach() * valid_mask, reduction='sum') / (
+            valid_mask.sum() + 1e-6)
+    # Metallic (L1)
+    loss += F.l1_loss(src_metal * valid_mask, warped_metallic.detach() * valid_mask, reduction='sum') / (
+            valid_mask.sum() + 1e-6)
 
-    # Albedo (Optional)
+    # Albedo (Optional, 同样替换为 L1)
     src_albedo = None
     warped_albedo = None
     if constraint_albedo:
         src_albedo = ensure_4d(src_maps[a_key])
         warped_albedo = warp_map(tgt_maps[a_key])
-        loss += F.mse_loss(src_albedo * valid_mask, warped_albedo.detach() * valid_mask, reduction='sum') / (
-                    valid_mask.sum() + 1e-6)
+        loss += F.l1_loss(src_albedo * valid_mask, warped_albedo.detach() * valid_mask, reduction='sum') / (
+                valid_mask.sum() + 1e-6)
 
     # ==========================================
-    # 5. Debug 可视化 (新增模块)
+    # 5. Debug 可视化
     # ==========================================
     if save_debug_path is not None:
         os.makedirs(save_debug_path, exist_ok=True)
