@@ -337,6 +337,44 @@ def get_prior_weight(current_iter, start_iter, decay_start_iter, end_iter, base_
     return base_weight * current_ratio
 
 
+
+
+def get_normal_propagation_bounds(args: Namespace, pbr_iteration: int) -> Tuple[int, int]:
+    """Return the absolute iteration range for reflection-driven normal propagation."""
+    prop_start = getattr(args, "normal_prop_start", 0)
+    if prop_start <= 0:
+        prop_start = pbr_iteration + 1
+    prop_iters = max(0, getattr(args, "normal_prop_iters", 0))
+    return prop_start, prop_start + prop_iters
+
+
+def is_normal_propagation_active(args: Namespace, iteration: int, pbr_iteration: int) -> bool:
+    if not getattr(args, "use_normal_propagation", False):
+        return False
+    if iteration <= pbr_iteration:
+        return False
+    prop_start, prop_end = get_normal_propagation_bounds(args, pbr_iteration)
+    return iteration >= prop_start and iteration < prop_end
+
+
+def set_gaussian_param_lr(gaussians: GaussianModel, group_names, lr: float) -> None:
+    """Set optimizer LR for selected Gaussian parameter groups if they exist."""
+    if gaussians.optimizer is None:
+        return
+    if isinstance(group_names, str):
+        group_names = {group_names}
+    else:
+        group_names = set(group_names)
+    for param_group in gaussians.optimizer.param_groups:
+        if param_group.get("name") in group_names:
+            param_group["lr"] = lr
+
+
+def set_optimizer_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
+    for param_group in optimizer.param_groups:
+        param_group["lr"] = lr
+
+
 def training(
     dataset: GroupParams,
     opt: GroupParams,
@@ -430,6 +468,17 @@ def training(
     normal_end = 15000  # 法线结束要早一点
     normal_min_ratio = 0.0  # 法线最后建议完全关闭，否则会影响高频纹理
 
+    if getattr(args, "use_normal_propagation", False):
+        prop_start, prop_end = get_normal_propagation_bounds(args, pbr_iteration)
+        print(
+            f"[Normal Propagation] enabled from iter {prop_start} to {prop_end - 1}; "
+            f"normal_lr={args.normal_prop_normal_lr}, "
+            f"material_lr_scale={args.normal_prop_material_lr_scale}, "
+            f"light_lr_scale={args.normal_prop_light_lr_scale}, "
+            f"rough_thresh={args.normal_prop_rough_thresh}, "
+            f"spec_thresh={args.normal_prop_spec_thresh}"
+        )
+
     # =========================================================
     # [Pre-compute] 基于 3D 空间距离的 KNN 邻居表
     # =========================================================
@@ -462,6 +511,18 @@ def training(
 
     for iteration in range(first_iter + 1, opt.iterations + 1):  # the real iteration (1 shift)
         iter_start.record()
+        normal_prop_active = is_normal_propagation_active(args, iteration, pbr_iteration)
+        if getattr(args, "use_normal_propagation", False):
+            if normal_prop_active:
+                set_gaussian_param_lr(gaussians, "normal", args.normal_prop_normal_lr)
+                material_lr = opt.BRDF_lr * args.normal_prop_material_lr_scale
+                set_gaussian_param_lr(gaussians, ["albedo", "roughness", "metallic"], material_lr)
+                set_optimizer_lr(light_optimizer, opt.opacity_lr * args.normal_prop_light_lr_scale)
+            else:
+                set_gaussian_param_lr(gaussians, "normal", opt.opacity_lr)
+                if iteration > pbr_iteration:
+                    set_gaussian_param_lr(gaussians, ["albedo", "roughness", "metallic"], opt.BRDF_lr)
+                set_optimizer_lr(light_optimizer, opt.opacity_lr)
         # Every 1000 its we increase the levels of SH up to a maximum degree
         if iteration % 1000 == 0:
             gaussians.oneupSHdegree()
@@ -1044,9 +1105,16 @@ def training(
             depth_pos = rendering_result["depth_pos"]
             normal_mask = rendering_result["normal_mask"]  # [1, H, W]
             cubemap.build_mips() # build mip for environment light
+
+            # 3DGS-DR-style normal propagation: only this scheduled window lets
+            # reflection/PBR gradients flow back into the learned Gaussian normals.
+            normals_for_pbr = normal_map.permute(1, 2, 0)  # [H, W, 3]
+            if not normal_prop_active:
+                normals_for_pbr = normals_for_pbr.detach()
+
             pbr_result = pbr_shading(
                 light=cubemap,
-                normals=normal_map.permute(1, 2, 0).detach(),  # [H, W, 3]
+                normals=normals_for_pbr,
                 view_dirs=view_dirs,
                 mask=normal_mask.permute(1, 2, 0),  # [H, W, 1]
                 albedo=albedo_map.permute(1, 2, 0),  # [H, W, 3]
@@ -1076,6 +1144,33 @@ def training(
             )
 
             specular_map = pbr_result["specular_rgb"].permute(2, 0, 1)
+
+            normal_prop_valid_ratio = 0.0
+            if normal_prop_active:
+                with torch.no_grad():
+                    low_rough_mask = roughness_map.detach() < args.normal_prop_rough_thresh
+                    high_spec_mask = (
+                        specular_map.detach().max(dim=0, keepdim=True)[0]
+                        > args.normal_prop_spec_thresh
+                    )
+                    prop_mask = (low_rough_mask | high_spec_mask) & normal_mask.detach().bool()
+                    normal_prop_valid_ratio = prop_mask.float().mean().item()
+
+                # Mask reflection-driven normal gradients to glossy/specular pixels.
+                # This keeps diffuse or uncertain regions controlled by existing
+                # normal-from-depth / mono-normal priors instead of noisy PBR signals.
+                normal_grad_mask = prop_mask.permute(1, 2, 0).float().expand_as(normals_for_pbr)
+                normals_for_pbr.register_hook(
+                    lambda grad, mask=normal_grad_mask: grad * mask * args.normal_prop_normal_grad_scale
+                )
+
+                # Low-LR/freeze material decomposition during propagation so the
+                # image residual is less likely to be absorbed by BRDF parameters.
+                material_grad_scale = args.normal_prop_material_grad_scale
+                if material_grad_scale != 1.0:
+                    albedo_map.register_hook(lambda grad, scale=material_grad_scale: grad * scale)
+                    roughness_map.register_hook(lambda grad, scale=material_grad_scale: grad * scale)
+                    metallic_map.register_hook(lambda grad, scale=material_grad_scale: grad * scale)
 
             # =========================================================
             # [Feature] 自监督高光掩膜 (Self-Supervised Specular Masking)
@@ -1109,6 +1204,14 @@ def training(
             render_rgb = render_direct + IRR
             pbr_render_loss = l1_loss(render_rgb, gt_image)
             loss = pbr_render_loss
+
+            if normal_prop_active and args.normal_prop_depth_weight > 0:
+                prop_depth_mask = rendering_result["normal_from_depth_mask"]
+                if prop_depth_mask.sum() > 100:
+                    loss += args.normal_prop_depth_weight * F.l1_loss(
+                        normal_map[:, prop_depth_mask],
+                        normal_map_from_depth[:, prop_depth_mask],
+                    )
 
             ### BRDF loss
             if (normal_mask == 0).sum() > 0:
@@ -1410,6 +1513,8 @@ def training(
                 # 只有当开启了功能，且进入了 PBR 阶段，且数值不为 0 时才显示
                 if args.use_consistency and iteration > pbr_iteration:
                     loss_log["Con"] = f"{loss_consist_val:.{5}f}"
+                if getattr(args, "use_normal_propagation", False) and normal_prop_active:
+                    loss_log["NProp"] = f"{normal_prop_valid_ratio:.{3}f}"
                 # =========================================================
 
                 # 3. 更新进度条 (注意这里的缩进，必须在 if use_mono_depth 外面)
@@ -1441,6 +1546,8 @@ def training(
 
                     if args.use_consistency and iteration > pbr_iteration:
                         tb_writer.add_scalar('train_loss_patches/consist_loss', loss_consist.item(), iteration)
+                    if getattr(args, "use_normal_propagation", False) and normal_prop_active:
+                        tb_writer.add_scalar('train_loss_patches/normal_prop_valid_ratio', normal_prop_valid_ratio, iteration)
                 #==========================================
 
             if iteration in saving_iterations:
@@ -1921,6 +2028,28 @@ if __name__ == "__main__":
     parser.add_argument("--gamma", action="store_true", help="Enable linear_to_sRGB for gamma correction.")
     parser.add_argument("--metallic", action="store_true", help="Enable metallic material reconstruction.")
     parser.add_argument("--indirect", action="store_true", help="Enable indirect diffuse modeling.")
+    parser.add_argument("--use_normal_propagation", action="store_true",
+                        help="Enable staged, masked reflection-gradient normal propagation during PBR training.")
+    parser.add_argument("--normal_prop_start", default=0, type=int,
+                        help="Absolute iteration to start normal propagation. <=0 starts right after --pbr_iteration.")
+    parser.add_argument("--normal_prop_iters", default=8000, type=int,
+                        help="Number of iterations to run normal propagation after normal_prop_start.")
+    parser.add_argument("--normal_prop_rough_thresh", default=0.35, type=float,
+                        help="Pixels with roughness below this threshold receive propagated normal gradients.")
+    parser.add_argument("--normal_prop_spec_thresh", default=0.03, type=float,
+                        help="Pixels with specular intensity above this threshold receive propagated normal gradients.")
+    parser.add_argument("--normal_prop_normal_lr", default=0.005, type=float,
+                        help="Low learning rate for Gaussian normal parameters during propagation.")
+    parser.add_argument("--normal_prop_normal_grad_scale", default=1.0, type=float,
+                        help="Additional scale for masked normal gradients during propagation.")
+    parser.add_argument("--normal_prop_depth_weight", default=0.05, type=float,
+                        help="Weak normal-from-depth stabilizer added during normal propagation.")
+    parser.add_argument("--normal_prop_material_lr_scale", default=0.1, type=float,
+                        help="LR multiplier for albedo/roughness/metallic params during propagation; 0 freezes optimizer updates.")
+    parser.add_argument("--normal_prop_material_grad_scale", default=0.1, type=float,
+                        help="Gradient multiplier for albedo/roughness/metallic maps during propagation; 0 freezes PBR material gradients.")
+    parser.add_argument("--normal_prop_light_lr_scale", default=0.25, type=float,
+                        help="LR multiplier for environment light optimizer during propagation.")
     #ljx:单目深度 损失函数权重参数
     # 【新增】位置约束开关
     parser.add_argument("--use_position_opt", action="store_true",
