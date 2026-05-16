@@ -1,4 +1,6 @@
 import os
+import csv
+import json
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 import sys
 import uuid
@@ -375,6 +377,353 @@ def set_optimizer_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
         param_group["lr"] = lr
 
 
+def build_normal_propagation_mask(
+    roughness_map: torch.Tensor,
+    specular_map: torch.Tensor,
+    normal_mask: torch.Tensor,
+    args: Namespace,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """Build a conservative reliability mask for reflection-driven normal propagation."""
+    with torch.no_grad():
+        low_rough_mask = roughness_map.detach() < args.normal_prop_rough_thresh
+        spec_intensity = specular_map.detach().max(dim=0, keepdim=True)[0]
+        high_spec_mask = spec_intensity > args.normal_prop_spec_thresh
+        valid_normal_mask = normal_mask.detach().bool()
+
+        if args.normal_prop_mask_mode == "rough_or_spec":
+            prop_mask = (low_rough_mask | high_spec_mask) & valid_normal_mask
+        elif args.normal_prop_mask_mode == "rough_only":
+            prop_mask = low_rough_mask & valid_normal_mask
+        elif args.normal_prop_mask_mode == "spec_only":
+            prop_mask = high_spec_mask & valid_normal_mask
+        else:
+            prop_mask = low_rough_mask & high_spec_mask & valid_normal_mask
+
+        image_ratio = prop_mask.float().mean().item()
+        valid_pixels = valid_normal_mask.float().sum().clamp_min(1.0)
+        valid_ratio = (prop_mask.float().sum() / valid_pixels).item()
+
+        if valid_ratio < args.normal_prop_min_valid_ratio or valid_ratio > args.normal_prop_max_valid_ratio:
+            prop_mask = torch.zeros_like(prop_mask, dtype=torch.bool)
+
+        stats = {
+            "image_ratio": image_ratio,
+            "valid_ratio": valid_ratio,
+            "rough_ratio": (low_rough_mask & valid_normal_mask).float().sum().div(valid_pixels).item(),
+            "spec_ratio": (high_spec_mask & valid_normal_mask).float().sum().div(valid_pixels).item(),
+            "skipped": float(prop_mask.sum().item() == 0),
+        }
+    return prop_mask, stats
+
+
+def save_normal_prop_debug(
+    save_dir: str,
+    iteration: int,
+    gt_image: torch.Tensor,
+    render_rgb: torch.Tensor,
+    normal_map: torch.Tensor,
+    normal_map_from_depth: torch.Tensor,
+    roughness_map: torch.Tensor,
+    specular_map: torch.Tensor,
+    prop_mask: torch.Tensor,
+    save_individual: bool = False,
+) -> None:
+    os.makedirs(save_dir, exist_ok=True)
+    with torch.no_grad():
+        gt = gt_image.detach().cpu().clamp(0, 1)
+        render = render_rgb.detach().cpu().clamp(0, 1)
+        error = torch.abs(render - gt)
+        error = error / (error.max() + 1e-6)
+        normal = ((normal_map.detach().cpu() + 1.0) * 0.5).clamp(0, 1)
+        depth_normal = ((normal_map_from_depth.detach().cpu() + 1.0) * 0.5).clamp(0, 1)
+        rough = roughness_map.detach().cpu().clamp(0, 1).repeat(3, 1, 1)
+        spec = specular_map.detach().cpu().max(dim=0, keepdim=True)[0].clamp(0, 1).repeat(3, 1, 1)
+        mask = prop_mask.detach().cpu().float().repeat(3, 1, 1)
+        mask_overlay = (0.65 * render + 0.35 * torch.tensor([1.0, 0.0, 0.0])[:, None, None] * mask).clamp(0, 1)
+        row1 = torch.cat([gt, render, error, mask_overlay], dim=2)
+        row2 = torch.cat([normal, depth_normal, rough, spec], dim=2)
+        torchvision.utils.save_image(torch.cat([row1, row2], dim=1), os.path.join(save_dir, f"iter_{iteration:05d}_normal_prop.jpg"))
+
+        if save_individual:
+            iter_dir = os.path.join(save_dir, f"iter_{iteration:05d}")
+            os.makedirs(iter_dir, exist_ok=True)
+            images = {
+                "gt": gt,
+                "render": render,
+                "error": error,
+                "mask_overlay": mask_overlay,
+                "normal": normal,
+                "normal_from_depth": depth_normal,
+                "roughness": rough,
+                "specular": spec,
+                "prop_mask": mask,
+            }
+            for name, image_tensor in images.items():
+                torchvision.utils.save_image(image_tensor, os.path.join(iter_dir, f"{name}.png"))
+
+
+class NormalPropagationDebugLogger:
+    """Write file-based normal-propagation diagnostics for non-TensorBoard workflows."""
+
+    def __init__(self, model_path: str, args: Namespace):
+        self.enabled = getattr(args, "use_normal_propagation", False) and getattr(args, "normal_prop_log_interval", 0) > 0
+        self.log_interval = max(1, getattr(args, "normal_prop_log_interval", 1))
+        self.drop_threshold = getattr(args, "normal_prop_advice_drop_psnr", 0.5)
+        self.reference_psnr_ema = None
+        self.active_psnr_ema = None
+        self.ema_decay = 0.95
+        self.csv_path = None
+        self.jsonl_path = None
+        self.summary_path = None
+
+        if self.enabled:
+            self.debug_dir = os.path.join(model_path, "debug_normal_propagation")
+            os.makedirs(self.debug_dir, exist_ok=True)
+            self.csv_path = os.path.join(self.debug_dir, "metrics.csv")
+            self.jsonl_path = os.path.join(self.debug_dir, "diagnosis.jsonl")
+            self.summary_path = os.path.join(self.debug_dir, "latest_summary.json")
+            if not os.path.exists(self.csv_path):
+                with open(self.csv_path, "w", newline="") as f:
+                    writer = csv.DictWriter(f, fieldnames=self._fieldnames())
+                    writer.writeheader()
+
+    @staticmethod
+    def _fieldnames() -> List[str]:
+        return [
+            "iteration",
+            "active",
+            "train_psnr",
+            "loss",
+            "pbr_l1",
+            "valid_ratio",
+            "image_ratio",
+            "rough_ratio",
+            "spec_ratio",
+            "skipped",
+            "grad_raw_norm",
+            "grad_masked_norm",
+            "grad_keep_ratio",
+            "normal_lr",
+            "material_lr",
+            "light_lr",
+            "recommendation",
+        ]
+
+    def _update_ema(self, value: float, active: bool) -> None:
+        if active:
+            current = self.active_psnr_ema
+            self.active_psnr_ema = value if current is None else self.ema_decay * current + (1.0 - self.ema_decay) * value
+        else:
+            current = self.reference_psnr_ema
+            self.reference_psnr_ema = value if current is None else self.ema_decay * current + (1.0 - self.ema_decay) * value
+
+    def _recommend(self, active: bool, stats: Dict[str, float], grad_stats: Dict[str, float]) -> str:
+        if not active:
+            return "collecting_reference"
+        if stats.get("skipped", 0.0) > 0.5:
+            if stats.get("valid_ratio", 0.0) < 1e-6:
+                return "mask_empty: lower --normal_prop_spec_thresh or try --normal_prop_mask_mode rough_or_spec"
+            return "mask_ratio_guard_triggered: inspect thresholds or widen min/max valid-ratio bounds"
+        if self.reference_psnr_ema is not None and self.active_psnr_ema is not None:
+            drop = self.reference_psnr_ema - self.active_psnr_ema
+            if drop > self.drop_threshold:
+                return "psnr_drop: reduce --normal_prop_normal_grad_scale, increase --normal_prop_ramp_iters, or use spec_only"
+        grad_keep = grad_stats.get("masked", 0.0) / max(grad_stats.get("raw", 0.0), 1e-12)
+        if grad_keep > 0.8 and stats.get("valid_ratio", 0.0) > 0.1:
+            return "broad_gradient: reduce --normal_prop_max_valid_ratio or switch to rough_and_spec/spec_only"
+        if grad_keep < 1e-4 and stats.get("valid_ratio", 0.0) > 0.0:
+            return "weak_gradient: inspect PBR/specular signal or raise --normal_prop_normal_grad_scale carefully"
+        return "ok"
+
+    def record(
+        self,
+        iteration: int,
+        active: bool,
+        train_psnr: float,
+        loss_value: float,
+        pbr_l1: Optional[float],
+        stats: Dict[str, float],
+        grad_stats: Dict[str, float],
+        lr_stats: Dict[str, float],
+    ) -> None:
+        if not self.enabled:
+            return
+
+        self._update_ema(train_psnr, active)
+        recommendation = self._recommend(active, stats, grad_stats)
+        should_log = iteration % self.log_interval == 0 or recommendation not in {"ok", "collecting_reference"}
+        if not should_log:
+            return
+
+        grad_keep_ratio = grad_stats.get("masked", 0.0) / max(grad_stats.get("raw", 0.0), 1e-12)
+        row = {
+            "iteration": iteration,
+            "active": int(active),
+            "train_psnr": train_psnr,
+            "loss": loss_value,
+            "pbr_l1": "" if pbr_l1 is None else pbr_l1,
+            "valid_ratio": stats.get("valid_ratio", 0.0),
+            "image_ratio": stats.get("image_ratio", 0.0),
+            "rough_ratio": stats.get("rough_ratio", 0.0),
+            "spec_ratio": stats.get("spec_ratio", 0.0),
+            "skipped": stats.get("skipped", 1.0),
+            "grad_raw_norm": grad_stats.get("raw", 0.0),
+            "grad_masked_norm": grad_stats.get("masked", 0.0),
+            "grad_keep_ratio": grad_keep_ratio,
+            "normal_lr": lr_stats.get("normal", 0.0),
+            "material_lr": lr_stats.get("material", 0.0),
+            "light_lr": lr_stats.get("light", 0.0),
+            "recommendation": recommendation,
+        }
+
+        with open(self.csv_path, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=self._fieldnames())
+            writer.writerow(row)
+
+        summary = {
+            **row,
+            "reference_psnr_ema": self.reference_psnr_ema,
+            "active_psnr_ema": self.active_psnr_ema,
+        }
+        with open(self.summary_path, "w") as f:
+            json.dump(summary, f, indent=2)
+        if recommendation not in {"ok", "collecting_reference"}:
+            with open(self.jsonl_path, "a") as f:
+                f.write(json.dumps(summary) + "\n")
+            print(f"[Normal Propagation Debug] Iter {iteration}: {recommendation}")
+
+
+def get_optimizer_group_lr(optimizer: Optional[torch.optim.Optimizer], group_name: str) -> float:
+    if optimizer is None:
+        return 0.0
+    for param_group in optimizer.param_groups:
+        if param_group.get("name") == group_name:
+            return float(param_group.get("lr", 0.0))
+    return 0.0
+
+
+def get_optimizer_first_lr(optimizer: Optional[torch.optim.Optimizer]) -> float:
+    if optimizer is None or len(optimizer.param_groups) == 0:
+        return 0.0
+    return float(optimizer.param_groups[0].get("lr", 0.0))
+
+
+class MultiViewConsistencyDebugLogger:
+    """File logger for multi-view material consistency without relying on TensorBoard."""
+
+    def __init__(self, model_path: str, args: Namespace):
+        self.enabled = getattr(args, "use_consistency", False) and getattr(args, "consistency_log_interval", 0) > 0
+        self.log_interval = max(1, getattr(args, "consistency_log_interval", 1))
+        self.csv_path = None
+        self.summary_path = None
+        if self.enabled:
+            self.debug_dir = os.path.join(model_path, "debug_consistency")
+            os.makedirs(self.debug_dir, exist_ok=True)
+            self.csv_path = os.path.join(self.debug_dir, "metrics.csv")
+            self.summary_path = os.path.join(self.debug_dir, "latest_summary.json")
+            if not os.path.exists(self.csv_path):
+                with open(self.csv_path, "w", newline="") as f:
+                    writer = csv.DictWriter(f, fieldnames=self._fieldnames())
+                    writer.writeheader()
+
+    @staticmethod
+    def _fieldnames() -> List[str]:
+        return [
+            "iteration", "src_uid", "tgt_uid", "rank", "loss", "weighted_loss",
+            "valid_ratio", "valid_pixels", "grid_ratio", "occ_ratio", "edge_ratio",
+            "facing_ratio", "src_depth_ratio", "tgt_depth_ratio", "rough_l1",
+            "metal_l1", "albedo_l1", "skipped", "recommendation",
+        ]
+
+    @staticmethod
+    def recommend(stats: Dict[str, float], min_valid_ratio: float, max_valid_ratio: float) -> str:
+        valid_ratio = stats.get("valid_ratio", 0.0)
+        if stats.get("skipped", 0.0) > 0.5 or valid_ratio < min_valid_ratio:
+            return "too_few_matches: use closer views, relax depth/edge thresholds, or lower --consistency_min_valid_ratio"
+        if valid_ratio > max_valid_ratio:
+            return "mask_too_broad: tighten occlusion/edge thresholds or lower --consistency_max_valid_ratio"
+        if stats.get("occ_ratio", 0.0) < 0.2:
+            return "occlusion_filter_strict_or_bad_projection: inspect debug masks and camera/depth scale"
+        if stats.get("edge_ratio", 0.0) < 0.2:
+            return "edge_filter_strict: increase --consistency_edge_rel_thresh if debug edges look valid"
+        if stats.get("rough_l1", 0.0) + stats.get("metal_l1", 0.0) > 0.5:
+            return "large_material_disagreement: lower --lambda_consistency or delay --consistency_start"
+        return "ok"
+
+    def record(
+        self,
+        iteration: int,
+        src_uid: int,
+        tgt_uid: int,
+        rank: int,
+        loss_value: float,
+        weighted_loss: float,
+        stats: Dict[str, float],
+        min_valid_ratio: float,
+        max_valid_ratio: float,
+    ) -> None:
+        if not self.enabled:
+            return
+        recommendation = self.recommend(stats, min_valid_ratio, max_valid_ratio)
+        if iteration % self.log_interval != 0 and recommendation == "ok":
+            return
+        row = {
+            "iteration": iteration,
+            "src_uid": src_uid,
+            "tgt_uid": tgt_uid,
+            "rank": rank,
+            "loss": loss_value,
+            "weighted_loss": weighted_loss,
+            "valid_ratio": stats.get("valid_ratio", 0.0),
+            "valid_pixels": stats.get("valid_pixels", 0.0),
+            "grid_ratio": stats.get("grid_ratio", 0.0),
+            "occ_ratio": stats.get("occ_ratio", 0.0),
+            "edge_ratio": stats.get("edge_ratio", 0.0),
+            "facing_ratio": stats.get("facing_ratio", 0.0),
+            "src_depth_ratio": stats.get("src_depth_ratio", 0.0),
+            "tgt_depth_ratio": stats.get("tgt_depth_ratio", 0.0),
+            "rough_l1": stats.get("rough_l1", 0.0),
+            "metal_l1": stats.get("metal_l1", 0.0),
+            "albedo_l1": stats.get("albedo_l1", 0.0),
+            "skipped": stats.get("skipped", 1.0),
+            "recommendation": recommendation,
+        }
+        with open(self.csv_path, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=self._fieldnames())
+            writer.writerow(row)
+        with open(self.summary_path, "w") as f:
+            json.dump(row, f, indent=2)
+        if recommendation != "ok":
+            print(f"[Consistency Debug] Iter {iteration}: {recommendation}")
+
+
+def build_camera_uid_to_index(train_cameras: List[Camera]) -> Dict[int, int]:
+    return {int(cam.uid): idx for idx, cam in enumerate(train_cameras)}
+
+
+def select_consistency_target(
+    viewpoint_cam: Camera,
+    train_cameras: List[Camera],
+    knn_map,
+    uid_to_index: Dict[int, int],
+    rank_min: int,
+    rank_max: int,
+) -> Tuple[Camera, int]:
+    src_idx = uid_to_index.get(int(viewpoint_cam.uid), None)
+    if src_idx is not None and len(train_cameras) > 1:
+        actual_min = max(1, min(rank_min, len(train_cameras) - 1))
+        actual_max = max(actual_min, min(rank_max, len(train_cameras) - 1))
+        rank = random.randint(actual_min, actual_max)
+        tgt_idx = int(knn_map[src_idx][rank])
+        return train_cameras[tgt_idx], rank
+
+    # Fallback for datasets whose uid no longer matches the train camera list.
+    candidates = [cam for cam in train_cameras if cam is not viewpoint_cam]
+    if not candidates:
+        return viewpoint_cam, 0
+    return random.choice(candidates), -1
+
+
 def training(
     dataset: GroupParams,
     opt: GroupParams,
@@ -468,6 +817,8 @@ def training(
     normal_end = 15000  # 法线结束要早一点
     normal_min_ratio = 0.0  # 法线最后建议完全关闭，否则会影响高频纹理
 
+    normal_prop_debug_logger = NormalPropagationDebugLogger(args.model_path, args)
+    consistency_debug_logger = MultiViewConsistencyDebugLogger(args.model_path, args)
     if getattr(args, "use_normal_propagation", False):
         prop_start, prop_end = get_normal_propagation_bounds(args, pbr_iteration)
         print(
@@ -476,7 +827,11 @@ def training(
             f"material_lr_scale={args.normal_prop_material_lr_scale}, "
             f"light_lr_scale={args.normal_prop_light_lr_scale}, "
             f"rough_thresh={args.normal_prop_rough_thresh}, "
-            f"spec_thresh={args.normal_prop_spec_thresh}"
+            f"spec_thresh={args.normal_prop_spec_thresh}, "
+            f"mask_mode={args.normal_prop_mask_mode}, "
+            f"valid_ratio=[{args.normal_prop_min_valid_ratio}, {args.normal_prop_max_valid_ratio}], "
+            f"ramp_iters={args.normal_prop_ramp_iters}, "
+            f"log_interval={args.normal_prop_log_interval}"
         )
 
     # =========================================================
@@ -504,6 +859,7 @@ def training(
     # 转回 CPU 存起来，省显存
     # 这里存的是 train_cameras 列表里的下标索引
     knn_map = sorted_indices.cpu().numpy()
+    camera_uid_to_index = build_camera_uid_to_index(train_cameras)
 
     print("空间邻居表构建完成。")
     # =========================================================
@@ -604,8 +960,34 @@ def training(
         loss_mono_depth = 0.0
         loss_omnidata = 0.0
         loss_consist = 0.0  # 【新增】初始化一致性 Loss
+        consistency_stats = {
+            "valid_ratio": 0.0,
+            "valid_pixels": 0.0,
+            "grid_ratio": 0.0,
+            "occ_ratio": 0.0,
+            "edge_ratio": 0.0,
+            "facing_ratio": 0.0,
+            "src_depth_ratio": 0.0,
+            "tgt_depth_ratio": 0.0,
+            "rough_l1": 0.0,
+            "metal_l1": 0.0,
+            "albedo_l1": 0.0,
+            "skipped": 1.0,
+        }
+        consistency_tgt_uid = -1
+        consistency_rank = -1
 
         aligned_mono_depth = None
+        train_render_for_metrics = image
+        pbr_render_loss_for_debug = None
+        normal_prop_stats = {
+            "image_ratio": 0.0,
+            "valid_ratio": 0.0,
+            "rough_ratio": 0.0,
+            "spec_ratio": 0.0,
+            "skipped": 1.0,
+        }
+        normal_prop_grad_stats = {"raw": 0.0, "masked": 0.0}
 
 
 
@@ -1146,23 +1528,37 @@ def training(
             specular_map = pbr_result["specular_rgb"].permute(2, 0, 1)
 
             normal_prop_valid_ratio = 0.0
+            normal_prop_stats = {
+                "image_ratio": 0.0,
+                "valid_ratio": 0.0,
+                "rough_ratio": 0.0,
+                "spec_ratio": 0.0,
+                "skipped": 1.0,
+            }
+            normal_prop_grad_stats = {"raw": 0.0, "masked": 0.0}
             if normal_prop_active:
-                with torch.no_grad():
-                    low_rough_mask = roughness_map.detach() < args.normal_prop_rough_thresh
-                    high_spec_mask = (
-                        specular_map.detach().max(dim=0, keepdim=True)[0]
-                        > args.normal_prop_spec_thresh
-                    )
-                    prop_mask = (low_rough_mask | high_spec_mask) & normal_mask.detach().bool()
-                    normal_prop_valid_ratio = prop_mask.float().mean().item()
-
-                # Mask reflection-driven normal gradients to glossy/specular pixels.
-                # This keeps diffuse or uncertain regions controlled by existing
-                # normal-from-depth / mono-normal priors instead of noisy PBR signals.
-                normal_grad_mask = prop_mask.permute(1, 2, 0).float().expand_as(normals_for_pbr)
-                normals_for_pbr.register_hook(
-                    lambda grad, mask=normal_grad_mask: grad * mask * args.normal_prop_normal_grad_scale
+                prop_mask, normal_prop_stats = build_normal_propagation_mask(
+                    roughness_map=roughness_map,
+                    specular_map=specular_map,
+                    normal_mask=normal_mask,
+                    args=args,
                 )
+                normal_prop_valid_ratio = normal_prop_stats["valid_ratio"]
+
+                # Mask reflection-driven normal gradients to reliable glossy/specular pixels.
+                # A ramp avoids a sudden PSNR drop when PBR normal gradients are first enabled.
+                normal_grad_mask = prop_mask.permute(1, 2, 0).float().expand_as(normals_for_pbr)
+                prop_start, _ = get_normal_propagation_bounds(args, pbr_iteration)
+                ramp = min(1.0, max(0.0, (iteration - prop_start + 1) / max(1, args.normal_prop_ramp_iters)))
+                normal_grad_scale = args.normal_prop_normal_grad_scale * ramp
+
+                def normal_prop_hook(grad, mask=normal_grad_mask, scale=normal_grad_scale, stats=normal_prop_grad_stats):
+                    masked_grad = grad * mask * scale
+                    stats["raw"] = grad.detach().norm().item()
+                    stats["masked"] = masked_grad.detach().norm().item()
+                    return masked_grad
+
+                normals_for_pbr.register_hook(normal_prop_hook)
 
                 # Low-LR/freeze material decomposition during propagation so the
                 # image residual is less likely to be absorbed by BRDF parameters.
@@ -1202,7 +1598,24 @@ def training(
             IRR = linear_to_srgb(IRR)
             IRR = kornia.filters.median_blur(IRR[None, ...], (3, 3))[0]
             render_rgb = render_direct + IRR
+            train_render_for_metrics = render_rgb
+
+            if normal_prop_active and args.normal_prop_debug_interval > 0 and iteration % args.normal_prop_debug_interval == 0:
+                save_normal_prop_debug(
+                    save_dir=os.path.join(args.model_path, "debug_normal_propagation"),
+                    iteration=iteration,
+                    gt_image=gt_image,
+                    render_rgb=render_rgb,
+                    normal_map=normal_map,
+                    normal_map_from_depth=normal_map_from_depth,
+                    roughness_map=roughness_map,
+                    specular_map=specular_map,
+                    prop_mask=prop_mask,
+                    save_individual=args.normal_prop_save_individual_images,
+                )
+
             pbr_render_loss = l1_loss(render_rgb, gt_image)
+            pbr_render_loss_for_debug = pbr_render_loss.detach().item()
             loss = pbr_render_loss
 
             if normal_prop_active and args.normal_prop_depth_weight > 0:
@@ -1274,113 +1687,89 @@ def training(
             # ==================================================================
             # [New Feature] 多视角一致性 (Optimized + Debug Version)
             # ==================================================================
-            if args.use_consistency and args.lambda_consistency > 0 and iteration > 32000 :#and (iteration % 5 == 0):
-
-                # 1. 变量名适配 (把主循环的渲染结果拿过来复用)
-                # 请根据你之前的报错，确认这里是 rendering_result 还是 render_pkg
+            consistency_start = args.consistency_start if args.consistency_start > 0 else pbr_iteration + args.consistency_start_offset
+            consistency_active = (
+                args.use_consistency
+                and args.lambda_consistency > 0
+                and iteration >= consistency_start
+                and (iteration % max(1, args.consistency_interval) == 0)
+            )
+            if consistency_active:
                 render_pkg_src = rendering_result
                 viewpoint_src = viewpoint_cam
 
-                # 2. 准备 Debug 路径 (关键！之前缺的就是这里)
                 debug_dir = None
-                # 每 500 次保存一张 (你可以改成 100 次方便测试)
-                if iteration % 50 == 0:
-                    debug_dir = os.path.join(args.model_path, "debug_warping")
-                    print(f"[Info] Debug warping image will be saved to {debug_dir}")
+                if args.consistency_debug_interval > 0 and iteration % args.consistency_debug_interval == 0:
+                    debug_dir = os.path.join(args.model_path, "debug_consistency")
+                    print(f"[Info] Debug consistency image will be saved to {debug_dir}")
 
-                # 3. 获取全量相机列表 (防止 empty range 报错)
-                full_cam_list = scene.getTrainCameras()
+                viewpoint_tgt, consistency_rank = select_consistency_target(
+                    viewpoint_cam=viewpoint_cam,
+                    train_cameras=train_cameras,
+                    knn_map=knn_map,
+                    uid_to_index=camera_uid_to_index,
+                    rank_min=args.consistency_rank_min,
+                    rank_max=args.consistency_rank_max,
+                )
+                consistency_tgt_uid = int(getattr(viewpoint_tgt, "uid", -1))
 
-                # 4. 随机选一个邻居
-                # =========================================================
-                # [Spatial Search] 空间最近邻采样
-                # =========================================================
-                viewpoint_tgt = None
-
-                # 定义物理邻居的排名范围 (Rank Range)
-                # 1 是最近的，但可能重叠度太高，视差太小
-                # 建议从 2 或 3 开始，到 6 或 8 结束
-                # 这样既保证了有视差，又保证了重叠度够高，能Warp成功
-                RANK_MIN = 2
-                RANK_MAX = 6
-
-                try:
-                    # 1. 我们需要知道当前 viewpoint_cam 在 train_cameras 列表里的下标
-                    # 也就是它的 uid
-                    # 注意：这里假设 viewpoint_cam.uid 对应 train_cameras 的索引
-                    # 如果不对应，可以用 train_cameras.index(viewpoint_cam) 查找(稍慢)
-                    curr_idx = viewpoint_cam.uid
-
-                    # 2. 随机选择一个排名
-                    # 限制范围，防止越界 (比如只有3张图)
-                    actual_max = min(RANK_MAX, num_cams - 1)
-                    actual_min = min(RANK_MIN, actual_max)
-
-                    if actual_max > actual_min:
-                        rand_rank = random.randint(actual_min, actual_max)
-
-                        # 3. 从 KNN 表里查出那个邻居的索引
-                        tgt_idx = knn_map[curr_idx][rand_rank]
-
-                        # 4. 取出相机
-                        viewpoint_tgt = train_cameras[tgt_idx]
-
-                except Exception:
-                    pass
-
-                # 5. 保底机制
-                if viewpoint_tgt is None:
-                    rand_idx = random.randint(0, len(train_cameras) - 1)
-                    viewpoint_tgt = train_cameras[rand_idx]
-
-                # =========================================================
-
-                # 5. 渲染目标视角 (这是唯一额外的一次渲染)
                 with torch.no_grad():
                     render_pkg_tgt = render(viewpoint_tgt, gaussians, pipe, background)
 
-                # 整理 Source 数据
                 src_maps = {
                     'roughness': render_pkg_src['roughness_map'],
                     'metallic': render_pkg_src['metallic_map'],
-                    'albedo': render_pkg_src['albedo_map']
+                    'albedo': render_pkg_src['albedo_map'],
                 }
-
-                # 整理 Target 数据
                 tgt_maps = {
                     'roughness': render_pkg_tgt['roughness_map'],
                     'metallic': render_pkg_tgt['metallic_map'],
-                    'albedo': render_pkg_tgt['albedo_map']
+                    'albedo': render_pkg_tgt['albedo_map'],
                 }
 
-                # # 计算粗糙度和金属度一致性Loss
-                loss_mat_ref_gs = material_consistency_loss(
+                loss_mat_ref_gs, consistency_stats = material_consistency_loss(
                     src_maps, render_pkg_src['depth_map'], viewpoint_src,
                     tgt_maps, render_pkg_tgt['depth_map'], viewpoint_tgt,
-                    constraint_albedo=False,  # 论文建议设为 False
-                    save_debug_path=debug_dir if iteration % 100 == 0 else None,  # 每100次存一张图
-                    iteration=iteration
+                    src_normal=render_pkg_src.get('normal_map', None),
+                    src_valid_mask=render_pkg_src.get('normal_mask', None),
+                    tgt_valid_mask=render_pkg_tgt.get('normal_mask', None),
+                    constraint_albedo=args.consistency_albedo,
+                    save_debug_path=debug_dir,
+                    iteration=iteration,
+                    occlusion_abs_thresh=args.consistency_occ_abs_thresh,
+                    occlusion_rel_thresh=args.consistency_occ_rel_thresh,
+                    edge_rel_thresh=args.consistency_edge_rel_thresh,
+                    facing_thresh=args.consistency_facing_thresh,
+                    robust_eps=args.consistency_robust_eps,
+                    return_stats=True,
                 )
 
-                # 建议权重：论文中没有明确给出 lambda_mv 的具体数值，
-                # 但通常这种辅助 Loss 权重在 0.01 到 0.1 之间
-                loss += args.lambda_consistency * loss_mat_ref_gs
-                loss_consist = loss_mat_ref_gs
+                if (
+                    consistency_stats["valid_ratio"] >= args.consistency_min_valid_ratio
+                    and consistency_stats["valid_ratio"] <= args.consistency_max_valid_ratio
+                    and consistency_stats["skipped"] < 0.5
+                ):
+                    consistency_weight = args.lambda_consistency * min(
+                        1.0,
+                        max(0.0, (iteration - consistency_start + 1) / max(1, args.consistency_ramp_iters)),
+                    )
+                    loss += consistency_weight * loss_mat_ref_gs
+                    loss_consist = loss_mat_ref_gs
+                else:
+                    consistency_weight = 0.0
+                    loss_consist = torch.zeros((), device=loss.device)
 
-
-                # 6. 计算Albedo一致性 Loss
-                # loss_consist, mask_vis = warp_consistency_loss(
-                #     src_albedo=render_pkg_src["albedo_map"],
-                #     src_depth=render_pkg_src["depth_map"],
-                #     src_cam=viewpoint_src,
-                #     tgt_albedo=render_pkg_tgt["albedo_map"],
-                #     tgt_depth=render_pkg_tgt["depth_map"],
-                #     tgt_cam=viewpoint_tgt,
-                #     save_debug_path=debug_dir,  # 【关键】传入路径
-                #     iteration=iteration  # 【关键】传入迭代次数
-                # )
-
-                loss += loss_consist * args.lambda_consistency
+                consistency_debug_logger.record(
+                    iteration=iteration,
+                    src_uid=int(getattr(viewpoint_src, "uid", -1)),
+                    tgt_uid=consistency_tgt_uid,
+                    rank=consistency_rank,
+                    loss_value=float(loss_consist.detach().item()) if isinstance(loss_consist, torch.Tensor) else float(loss_consist),
+                    weighted_loss=float(consistency_weight * (loss_consist.detach().item() if isinstance(loss_consist, torch.Tensor) else loss_consist)),
+                    stats=consistency_stats,
+                    min_valid_ratio=args.consistency_min_valid_ratio,
+                    max_valid_ratio=args.consistency_max_valid_ratio,
+                )
 
             if iteration % 100 == 0:
                 save_pbr_debug_montage(
@@ -1470,6 +1859,24 @@ def training(
         loss.backward()
         # print("back")
 
+        with torch.no_grad():
+            current_train_psnr = psnr(train_render_for_metrics.clamp(0.0, 1.0), gt_image.clamp(0.0, 1.0)).mean().item()
+            if iteration > pbr_iteration:
+                normal_prop_debug_logger.record(
+                    iteration=iteration,
+                    active=normal_prop_active,
+                    train_psnr=current_train_psnr,
+                    loss_value=loss.detach().item(),
+                    pbr_l1=pbr_render_loss_for_debug,
+                    stats=normal_prop_stats,
+                    grad_stats=normal_prop_grad_stats,
+                    lr_stats={
+                        "normal": get_optimizer_group_lr(gaussians.optimizer, "normal"),
+                        "material": get_optimizer_group_lr(gaussians.optimizer, "albedo"),
+                        "light": get_optimizer_first_lr(light_optimizer),
+                    },
+                )
+
         iter_end.record()
 
         with torch.no_grad():
@@ -1513,8 +1920,10 @@ def training(
                 # 只有当开启了功能，且进入了 PBR 阶段，且数值不为 0 时才显示
                 if args.use_consistency and iteration > pbr_iteration:
                     loss_log["Con"] = f"{loss_consist_val:.{5}f}"
+                    loss_log["ConV"] = f"{consistency_stats['valid_ratio']:.{3}f}"
                 if getattr(args, "use_normal_propagation", False) and normal_prop_active:
                     loss_log["NProp"] = f"{normal_prop_valid_ratio:.{3}f}"
+                    loss_log["NPskip"] = f"{int(normal_prop_stats['skipped'])}"
                 # =========================================================
 
                 # 3. 更新进度条 (注意这里的缩进，必须在 if use_mono_depth 外面)
@@ -1545,9 +1954,21 @@ def training(
                         tb_writer.add_scalar('train_loss_patches/mono_depth_loss', loss_mono_depth_val, iteration)
 
                     if args.use_consistency and iteration > pbr_iteration:
-                        tb_writer.add_scalar('train_loss_patches/consist_loss', loss_consist.item(), iteration)
+                        tb_writer.add_scalar('train_loss_patches/consist_loss', loss_consist.item() if isinstance(loss_consist, torch.Tensor) else loss_consist, iteration)
+                        tb_writer.add_scalar('train_loss_patches/consist_valid_ratio', consistency_stats["valid_ratio"], iteration)
+                        tb_writer.add_scalar('train_loss_patches/consist_occ_ratio', consistency_stats["occ_ratio"], iteration)
+                        tb_writer.add_scalar('train_loss_patches/consist_edge_ratio', consistency_stats["edge_ratio"], iteration)
+                        tb_writer.add_scalar('train_loss_patches/consist_rough_l1', consistency_stats["rough_l1"], iteration)
+                        tb_writer.add_scalar('train_loss_patches/consist_metal_l1', consistency_stats["metal_l1"], iteration)
+                        tb_writer.add_scalar('train_loss_patches/consist_skipped', consistency_stats["skipped"], iteration)
                     if getattr(args, "use_normal_propagation", False) and normal_prop_active:
                         tb_writer.add_scalar('train_loss_patches/normal_prop_valid_ratio', normal_prop_valid_ratio, iteration)
+                        tb_writer.add_scalar('train_loss_patches/normal_prop_image_ratio', normal_prop_stats["image_ratio"], iteration)
+                        tb_writer.add_scalar('train_loss_patches/normal_prop_rough_ratio', normal_prop_stats["rough_ratio"], iteration)
+                        tb_writer.add_scalar('train_loss_patches/normal_prop_spec_ratio', normal_prop_stats["spec_ratio"], iteration)
+                        tb_writer.add_scalar('train_loss_patches/normal_prop_skipped', normal_prop_stats["skipped"], iteration)
+                        tb_writer.add_scalar('train_loss_patches/normal_prop_grad_raw_norm', normal_prop_grad_stats["raw"], iteration)
+                        tb_writer.add_scalar('train_loss_patches/normal_prop_grad_masked_norm', normal_prop_grad_stats["masked"], iteration)
                 #==========================================
 
             if iteration in saving_iterations:
@@ -2050,6 +2471,23 @@ if __name__ == "__main__":
                         help="Gradient multiplier for albedo/roughness/metallic maps during propagation; 0 freezes PBR material gradients.")
     parser.add_argument("--normal_prop_light_lr_scale", default=0.25, type=float,
                         help="LR multiplier for environment light optimizer during propagation.")
+    parser.add_argument("--normal_prop_mask_mode", default="rough_and_spec",
+                        choices=["rough_and_spec", "rough_or_spec", "rough_only", "spec_only"],
+                        help="Reliability mask used for normal propagation. rough_and_spec is the safest default; rough_or_spec matches the original permissive behavior.")
+    parser.add_argument("--normal_prop_min_valid_ratio", default=0.001, type=float,
+                        help="Skip normal propagation for a view if the selected valid-mask ratio is below this value.")
+    parser.add_argument("--normal_prop_max_valid_ratio", default=0.25, type=float,
+                        help="Skip normal propagation for a view if the selected valid-mask ratio is above this value; high values usually mean an over-broad noisy mask.")
+    parser.add_argument("--normal_prop_ramp_iters", default=1000, type=int,
+                        help="Linearly ramp masked normal-gradient scale over this many propagation iterations.")
+    parser.add_argument("--normal_prop_debug_interval", default=500, type=int,
+                        help="Save normal-propagation debug montages every N active iterations; <=0 disables image dumps.")
+    parser.add_argument("--normal_prop_save_individual_images", action="store_true",
+                        help="Also save separate PNGs for each normal-propagation debug layer beside the montage.")
+    parser.add_argument("--normal_prop_log_interval", default=50, type=int,
+                        help="Write CSV/JSON file diagnostics every N iterations; <=0 disables file diagnostics.")
+    parser.add_argument("--normal_prop_advice_drop_psnr", default=0.5, type=float,
+                        help="Emit an automatic diagnosis when active PSNR EMA drops this many dB below the pre-propagation reference EMA.")
     #ljx:单目深度 损失函数权重参数
     # 【新增】位置约束开关
     parser.add_argument("--use_position_opt", action="store_true",
@@ -2070,8 +2508,40 @@ if __name__ == "__main__":
     # [New Feature] 多视角重投影一致性参数
     parser.add_argument("--use_consistency", action="store_true",
                         help="Enable multi-view reprojection consistency loss.")
-    parser.add_argument("--lambda_consistency", default=0.1, type=float,
-                        help="Weight for consistency loss. Suggest 0.01 - 0.1")
+    parser.add_argument("--lambda_consistency", default=0.05, type=float,
+                        help="Weight for consistency loss. Suggest starting from 0.01 - 0.05; the previous 0.1 can over-regularize materials.")
+    parser.add_argument("--consistency_start", default=0, type=int,
+                        help="Absolute iteration to start multi-view material consistency. <=0 uses pbr_iteration + consistency_start_offset.")
+    parser.add_argument("--consistency_start_offset", default=2000, type=int,
+                        help="Delay after pbr_iteration before enabling consistency when consistency_start <= 0.")
+    parser.add_argument("--consistency_interval", default=5, type=int,
+                        help="Compute multi-view consistency every N iterations to reduce noisy gradients and cost.")
+    parser.add_argument("--consistency_ramp_iters", default=1000, type=int,
+                        help="Linearly ramp consistency weight over this many active iterations.")
+    parser.add_argument("--consistency_rank_min", default=1, type=int,
+                        help="Minimum spatial-KNN neighbor rank for target view sampling; 1 is nearest non-self view.")
+    parser.add_argument("--consistency_rank_max", default=4, type=int,
+                        help="Maximum spatial-KNN neighbor rank for target view sampling.")
+    parser.add_argument("--consistency_min_valid_ratio", default=0.002, type=float,
+                        help="Skip consistency if reprojected valid mask ratio is below this value.")
+    parser.add_argument("--consistency_max_valid_ratio", default=0.5, type=float,
+                        help="Skip consistency if reprojected valid mask ratio is above this value, which usually indicates an over-broad unreliable mask.")
+    parser.add_argument("--consistency_occ_abs_thresh", default=0.02, type=float,
+                        help="Absolute depth agreement threshold for reprojection occlusion filtering.")
+    parser.add_argument("--consistency_occ_rel_thresh", default=0.01, type=float,
+                        help="Relative depth agreement threshold for reprojection occlusion filtering.")
+    parser.add_argument("--consistency_edge_rel_thresh", default=0.03, type=float,
+                        help="Relative source-depth edge threshold; lower values reject more depth discontinuities.")
+    parser.add_argument("--consistency_facing_thresh", default=0.02, type=float,
+                        help="Minimum normal dot target-view direction for consistency pixels.")
+    parser.add_argument("--consistency_robust_eps", default=1e-3, type=float,
+                        help="Charbonnier epsilon for robust material consistency loss.")
+    parser.add_argument("--consistency_albedo", action="store_true",
+                        help="Also constrain albedo consistency; disabled by default to avoid baking lighting errors.")
+    parser.add_argument("--consistency_debug_interval", default=250, type=int,
+                        help="Save multi-view consistency mask/error montages every N iterations; <=0 disables image dumps.")
+    parser.add_argument("--consistency_log_interval", default=50, type=int,
+                        help="Write CSV/JSON consistency diagnostics every N iterations; <=0 disables file logging.")
 
     # [新增] 开关中性光loss
     # action='store_true' 表示：只要命令行里写了 --use_light，这个值就是 True，否则是 False

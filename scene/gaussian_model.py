@@ -407,15 +407,16 @@ class GaussianModel:
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
 
     def update_learning_rate(self, iteration: int) -> float:
-        """Learning rate scheduling per step"""
+        """Learning rate scheduling per step."""
+        xyz_lr = 0.0
+        brdf_lr = self.BRDF_scheduler_args(iteration - 30000)
         for param_group in self.optimizer.param_groups:
-            if param_group["name"] == "albedo" or param_group["name"] == "roughness" or param_group["name"] == "metallic":
-                lr = self.BRDF_scheduler_args(iteration-30000)
-                param_group["lr"] = lr
-                return lr
-            if param_group["name"] == "xyz":
-                lr = self.xyz_scheduler_args(iteration)
-                param_group["lr"] = lr
+            if param_group["name"] in {"albedo", "roughness", "metallic"}:
+                param_group["lr"] = brdf_lr
+            elif param_group["name"] == "xyz":
+                xyz_lr = self.xyz_scheduler_args(iteration)
+                param_group["lr"] = xyz_lr
+        return xyz_lr
 
     def construct_list_of_attributes(self) -> List[str]:
         l = ["x", "y", "z"]
