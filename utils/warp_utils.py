@@ -172,143 +172,176 @@ def get_normal_facing_mask(xyz_world, src_normal, tgt_cam, threshold=0.05):
 def material_consistency_loss(
         src_maps, src_depth, src_cam,
         tgt_maps, tgt_depth, tgt_cam,
-        src_normal=None,  # [新增] Source 视角的法线图
+        src_normal=None,
+        src_valid_mask=None,
+        tgt_valid_mask=None,
         constraint_albedo=False,
-        patch_size=7,
         save_debug_path=None,
-        iteration=0
+        iteration=0,
+        min_depth=1e-4,
+        occlusion_abs_thresh=0.02,
+        occlusion_rel_thresh=0.01,
+        edge_rel_thresh=0.03,
+        facing_thresh=0.02,
+        robust_eps=1e-3,
+        return_stats=False,
 ):
     """
-    MaterialRefGS 风格的多视角材质一致性约束 (带 Debug 可视化)
-    已修改: 使用 L1 Loss 替代 MSE Loss，保持材质边界锐利
+    Multi-view material consistency for the same reprojected 3D surface point.
+
+    The target branch is detached intentionally: the loss regularizes the current
+    source view while the random training view schedule makes the constraint
+    symmetric over time. Masks are scale-aware and detached to avoid geometry
+    gradients from a material regularizer.
     """
 
-    # 0. 辅助函数：确保 4D [N, C, H, W]
     def ensure_4d(tensor):
-        if tensor.dim() == 3: return tensor.unsqueeze(1)
+        if tensor.dim() == 2:
+            return tensor[None, None]
+        if tensor.dim() == 3:
+            return tensor.unsqueeze(0)
         return tensor
 
-    # 【必须添加这一行！】彻底切断几何梯度
-    src_depth = src_depth.detach()
+    def get_map(maps, canonical_name):
+        aliases = {
+            "roughness": ("roughness", "roughness_map"),
+            "metallic": ("metallic", "metallic_map"),
+            "albedo": ("albedo", "albedo_map"),
+        }[canonical_name]
+        for key in aliases:
+            if key in maps:
+                return maps[key]
+        raise KeyError(f"Missing {canonical_name} in material maps; tried {aliases}")
 
-    # 1. 几何 Warping 准备
-    if src_depth.dim() == 4: src_depth = src_depth.squeeze(1)
-    if tgt_depth.dim() == 3: tgt_depth = tgt_depth.unsqueeze(1)
+    def masked_charbonnier(src, tgt, mask):
+        diff = (src - tgt.detach()) * mask
+        return torch.sqrt(diff * diff + robust_eps * robust_eps).sum() / (mask.sum() * src.shape[1] + 1e-6)
 
-    xyz_world = depth_point_to_world(src_depth, src_cam)
+    src_depth = ensure_4d(src_depth).detach()
+    tgt_depth = ensure_4d(tgt_depth).detach()
+    src_depth_3d = src_depth.squeeze(1)
+
+    xyz_world = depth_point_to_world(src_depth_3d, src_cam)
     grid, projected_z = reproject_to_view(xyz_world, tgt_cam)
     valid_grid_mask = (grid.abs().max(dim=-1)[0] < 0.99).float().unsqueeze(1)
 
-    # 2. 采样 Target
-    def warp_map(img):
+    def warp_map(img, detach=True):
         img_4d = ensure_4d(img)
+        if detach:
+            img_4d = img_4d.detach()
         return F.grid_sample(img_4d, grid, align_corners=True, padding_mode='zeros')
 
-    # 键名适配
-    r_key = 'roughness_map' if 'roughness_map' in tgt_maps else 'roughness'
-    m_key = 'metallic_map' if 'metallic_map' in tgt_maps else 'metallic'
-    a_key = 'albedo_map' if 'albedo_map' in tgt_maps else 'albedo'
+    src_rough = ensure_4d(get_map(src_maps, 'roughness'))
+    src_metal = ensure_4d(get_map(src_maps, 'metallic'))
+    warped_roughness = warp_map(get_map(tgt_maps, 'roughness'))
+    warped_metallic = warp_map(get_map(tgt_maps, 'metallic'))
+    warped_tgt_depth = warp_map(tgt_depth, detach=True)
 
-    src_rough = ensure_4d(src_maps[r_key])
-    src_metal = ensure_4d(src_maps[m_key])
+    src_depth_mask = (src_depth > min_depth).float()
+    tgt_depth_mask = (warped_tgt_depth > min_depth).float()
+    if src_valid_mask is not None:
+        src_depth_mask = src_depth_mask * ensure_4d(src_valid_mask).detach().float()
+    if tgt_valid_mask is not None:
+        warped_tgt_valid = warp_map(tgt_valid_mask.float(), detach=True)
+        tgt_depth_mask = tgt_depth_mask * (warped_tgt_valid > 0.5).float()
 
-    warped_roughness = warp_map(tgt_maps[r_key])
-    warped_metallic = warp_map(tgt_maps[m_key])
-    warped_tgt_depth = F.grid_sample(tgt_depth, grid, align_corners=True, padding_mode='zeros')
+    facing_mask = get_normal_facing_mask(xyz_world, src_normal, tgt_cam, threshold=facing_thresh)
 
-    # 3. Mask
-    # [新增] 计算法线朝向掩码
-    facing_mask = get_normal_facing_mask(xyz_world, src_normal, tgt_cam, threshold=0.05)
-
-    # 极度严苛的边缘剔除 (0.02 - 0.03)
     dy = torch.abs(src_depth[..., 1:, :] - src_depth[..., :-1, :])
     dx = torch.abs(src_depth[..., :, 1:] - src_depth[..., :, :-1])
     dy = F.pad(dy, (0, 0, 0, 1))
     dx = F.pad(dx, (0, 1, 0, 0))
-    edge_mask = ((dy + dx) < 0.02).float()  # 剔除任何深度稍微不平滑的地方
-    depth_bias = 0.02  # 深度遮挡阈值收紧，从之前的 0.05 改为 0.02
-    occ_mask = (projected_z < (warped_tgt_depth + depth_bias)).float()
+    relative_depth_edge = (dy + dx) / (src_depth.abs() + 1e-6)
+    edge_mask = (relative_depth_edge < edge_rel_thresh).float()
 
-    # 将 edge_mask 加到最终的 valid_mask 里
-    valid_mask = valid_grid_mask * occ_mask * facing_mask * edge_mask
+    depth_delta = torch.abs(projected_z - warped_tgt_depth)
+    occ_mask = ((depth_delta < occlusion_abs_thresh) | (depth_delta / (warped_tgt_depth.abs() + 1e-6) < occlusion_rel_thresh)).float()
 
-    # 【非常重要】确保 mask 本身不传回梯度
-    valid_mask = valid_mask.detach()
+    valid_mask = (valid_grid_mask * src_depth_mask * tgt_depth_mask * occ_mask * facing_mask * edge_mask).detach()
+    valid_pixels = valid_mask.sum()
+    image_pixels = valid_mask.numel()
 
-    if valid_mask.sum() < 10:
-        return torch.tensor(0.0, device=src_depth.device)
+    stats = {
+        "valid_pixels": float(valid_pixels.detach().item()),
+        "valid_ratio": float((valid_pixels / max(1, image_pixels)).detach().item()),
+        "grid_ratio": float(valid_grid_mask.mean().detach().item()),
+        "occ_ratio": float(occ_mask.mean().detach().item()),
+        "edge_ratio": float(edge_mask.mean().detach().item()),
+        "facing_ratio": float(facing_mask.mean().detach().item()),
+        "src_depth_ratio": float(src_depth_mask.mean().detach().item()),
+        "tgt_depth_ratio": float(tgt_depth_mask.mean().detach().item()),
+        "rough_l1": 0.0,
+        "metal_l1": 0.0,
+        "albedo_l1": 0.0,
+        "skipped": 0.0,
+    }
 
-    # ==========================================
-    # 4. 计算 Loss (已全部替换为 L1 Loss)
-    # ==========================================
-    loss = 0.0
+    if valid_pixels < 10:
+        stats["skipped"] = 1.0
+        zero = torch.zeros((), device=src_depth.device, dtype=src_depth.dtype)
+        return (zero, stats) if return_stats else zero
 
-    # Roughness (L1)
-    loss += F.l1_loss(src_rough * valid_mask, warped_roughness.detach() * valid_mask, reduction='sum') / (
-            valid_mask.sum() + 1e-6)
-    # Metallic (L1)
-    loss += F.l1_loss(src_metal * valid_mask, warped_metallic.detach() * valid_mask, reduction='sum') / (
-            valid_mask.sum() + 1e-6)
+    rough_loss = masked_charbonnier(src_rough, warped_roughness, valid_mask)
+    metal_loss = masked_charbonnier(src_metal, warped_metallic, valid_mask)
+    loss = rough_loss + metal_loss
+    stats["rough_l1"] = float((torch.abs(src_rough - warped_roughness.detach()) * valid_mask).sum().div(valid_pixels + 1e-6).detach().item())
+    stats["metal_l1"] = float((torch.abs(src_metal - warped_metallic.detach()) * valid_mask).sum().div(valid_pixels + 1e-6).detach().item())
 
-    # Albedo (Optional, 同样替换为 L1)
     src_albedo = None
     warped_albedo = None
     if constraint_albedo:
-        src_albedo = ensure_4d(src_maps[a_key])
-        warped_albedo = warp_map(tgt_maps[a_key])
-        loss += F.l1_loss(src_albedo * valid_mask, warped_albedo.detach() * valid_mask, reduction='sum') / (
-                valid_mask.sum() + 1e-6)
+        src_albedo = ensure_4d(get_map(src_maps, 'albedo'))
+        warped_albedo = warp_map(get_map(tgt_maps, 'albedo'))
+        albedo_loss = masked_charbonnier(src_albedo, warped_albedo, valid_mask)
+        loss = loss + albedo_loss
+        stats["albedo_l1"] = float((torch.abs(src_albedo - warped_albedo.detach()) * valid_mask).sum().div(valid_pixels + 1e-6).detach().item())
 
-    # ==========================================
-    # 5. Debug 可视化
-    # ==========================================
     if save_debug_path is not None:
         os.makedirs(save_debug_path, exist_ok=True)
         with torch.no_grad():
-            # 辅助函数：转为3通道以便拼接
             def to_3ch(img):
-                if img is None: return None
-                img = img.detach()
-                if img.shape[1] == 1: return img.repeat(1, 3, 1, 1)
+                if img is None:
+                    return None
+                img = img.detach().clamp(0, 1)
+                if img.shape[1] == 1:
+                    return img.repeat(1, 3, 1, 1)
                 return img
 
-            # 准备 Mask 可视化 (白色为有效区域)
-            vis_mask = to_3ch(valid_mask)
-
-            # --- 第一行: Roughness 分析 ---
-            row_rough = torch.cat([
-                to_3ch(src_rough),  # 1. Src Roughness
-                to_3ch(warped_roughness),  # 2. Warped Tgt Roughness (应与1一致)
-                vis_mask,  # 3. 有效 Mask (白色为计算区域)
-                to_3ch((src_rough - warped_roughness).abs() * valid_mask * 5.0)  # 4. 误差热力 (放大5倍)
+            masks_row = torch.cat([
+                to_3ch(valid_mask),
+                to_3ch(valid_grid_mask),
+                to_3ch(occ_mask),
+                to_3ch(edge_mask),
+                to_3ch(facing_mask),
             ], dim=3)
-
-            # --- 第二行: Metallic 分析 ---
+            row_rough = torch.cat([
+                to_3ch(src_rough),
+                to_3ch(warped_roughness),
+                to_3ch((src_rough - warped_roughness).abs() * valid_mask * 5.0),
+                to_3ch(src_depth_mask),
+                to_3ch(tgt_depth_mask),
+            ], dim=3)
             row_metal = torch.cat([
                 to_3ch(src_metal),
                 to_3ch(warped_metallic),
-                vis_mask,
-                to_3ch((src_metal - warped_metallic).abs() * valid_mask * 5.0)
+                to_3ch((src_metal - warped_metallic).abs() * valid_mask * 5.0),
+                to_3ch(relative_depth_edge / (edge_rel_thresh + 1e-6)),
+                to_3ch((depth_delta / (occlusion_abs_thresh + 1e-6)).clamp(0, 1)),
             ], dim=3)
-
-            # --- 组合所有行 ---
-            final_grid = torch.cat([row_rough, row_metal], dim=2)  # 垂直拼接
-
-            # --- 第三行: Albedo 分析 (如果开启) ---
+            final_grid = torch.cat([masks_row, row_rough, row_metal], dim=2)
             if constraint_albedo and src_albedo is not None:
                 row_albedo = torch.cat([
                     to_3ch(src_albedo),
                     to_3ch(warped_albedo),
-                    vis_mask,
-                    to_3ch((src_albedo - warped_albedo).abs() * valid_mask * 5.0)
+                    to_3ch((src_albedo - warped_albedo).abs() * valid_mask * 5.0),
+                    to_3ch(valid_mask),
+                    to_3ch(valid_mask),
                 ], dim=3)
                 final_grid = torch.cat([final_grid, row_albedo], dim=2)
-
-            # 保存
             file_name = os.path.join(save_debug_path, f"debug_mat_consist_{iteration:05d}.jpg")
             torchvision.utils.save_image(final_grid, file_name)
 
-    return loss
+    return (loss, stats) if return_stats else loss
 
 def warp_consistency_loss(
         src_albedo, src_depth, src_cam,

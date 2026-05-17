@@ -505,6 +505,35 @@ def readColmapSceneInfo(path: str, images: str, eval: bool, llffhold: int = 8,us
     return scene_info
 
 
+def _flatten_blender_frame_name(file_path: str, suffix: str = "") -> str:
+    """Return the flattened TensoIR/Blender prior filename stem for a frame path.
+
+    TensoIR frames are commonly stored as ``train_000/rgba.png`` while
+    generated mono priors are stored in a sibling ``*_full`` directory using a
+    flattened name such as ``train_000_rgba.png`` or
+    ``train_000_rgba_normal.png``.
+    """
+    normalized = file_path.replace("\\", "/").lstrip("./")
+    stem = os.path.splitext(normalized)[0]
+    flattened = "_".join(part for part in stem.split("/") if part)
+    return f"{flattened}{suffix}"
+
+
+def _tensorir_full_root(path: str) -> str:
+    """Return the default TensoIR ``*_full`` prior root for a Blender scene."""
+    normalized = os.path.normpath(path)
+    if os.path.basename(normalized).endswith("_full"):
+        return normalized
+    return f"{normalized}_full"
+
+
+def _first_existing_path(candidates: List[str]) -> Optional[str]:
+    for candidate in candidates:
+        if candidate and os.path.exists(candidate):
+            return candidate
+    return None
+
+
 def readCamerasFromTransforms(
     path: str, transformsfile: str, white_background: bool, extension: str = ".png",use_depth=False, use_normal=False
 ) -> List[CameraInfo]:
@@ -524,33 +553,39 @@ def readCamerasFromTransforms(
         depth_mono_path = None
         normal_mono_path = None
 
+        tensorir_root = _tensorir_full_root(path)
+        flattened_frame_name = _flatten_blender_frame_name(file_path)
+
         # 3. 寻找深度图 (仅当开关 use_depth=True 时)
         if use_depth:
-            # 优先尝试 _disp.tiff (Blender数据集常用格式)
-            #depth_candidate = os.path.join(path, file_path + "_disp.tiff")
-            depth_candidate = os.path.join(path, file_path + "_disp.png")
-            if os.path.exists(depth_candidate):
-                depth_mono_path = depth_candidate
-                #print(f"DEBUG: 正在寻找深度图 -> {depth_candidate}")
-            else:
-                # 备选尝试 _disp.png
-                depth_candidate = os.path.join(path, file_path + "_disp.png")
-                if os.path.exists(depth_candidate):
-                    depth_mono_path = depth_candidate
+            # TensoIR/Blender 默认布局：
+            #   lego/train_000/rgba.png -> lego_full/mono_depth/train_000_rgba.png
+            # 保留旧的 in-scene ``*_disp`` 命名作为兼容兜底。
+            depth_candidates = [
+                os.path.join(tensorir_root, "mono_depth", f"{flattened_frame_name}.png"),
+                os.path.join(tensorir_root, "mono_depth", f"{flattened_frame_name}.jpg"),
+                os.path.join(path, file_path + "_disp.png"),
+                os.path.join(path, file_path + "_disp.tiff"),
+                os.path.join(path, file_path + "_disp.tif"),
+            ]
+            depth_mono_path = _first_existing_path(depth_candidates)
+            if depth_mono_path is None:
+                print("[Warning] Depth map not found. Tried:\n  " + "\n  ".join(depth_candidates))
 
         # 4. 寻找法线图 (仅当开关 use_normal=True 时)
         if use_normal:
-            # 尝试 _normal.png
-            normal_path = file_path.replace("rgba", "normal.png")
-            normal_mono_path = os.path.join(path, normal_path)
-            # normal_candidate = os.path.join(path, file_path + "_normal.png")
-            # #print("候选为:",normal_candidate)
-            # if os.path.exists(normal_candidate):
-            #     normal_mono_path = normal_candidate
-            # else:
-            #     normal_mono_path = os.path.join(path, file_path + " /normal.png")
-        #print("path:",path) #lego
-        #print(normal_mono_path)
+            # TensoIR/Blender 默认布局：
+            #   lego/train_000/rgba.png -> lego_full/mono_normal/train_000_rgba_normal.png
+            # 保留 ``train_000/normal.png`` 和 ``*_normal.png`` 作为兼容兜底。
+            normal_candidates = [
+                os.path.join(tensorir_root, "mono_normal", f"{flattened_frame_name}_normal.png"),
+                os.path.join(tensorir_root, "mono_normal", f"{flattened_frame_name}.png"),
+                os.path.join(path, file_path.replace("rgba", "normal.png")),
+                os.path.join(path, file_path + "_normal.png"),
+            ]
+            normal_mono_path = _first_existing_path(normal_candidates)
+            if normal_mono_path is None:
+                print("[Warning] Normal map not found. Tried:\n  " + "\n  ".join(normal_candidates))
 
         cam_name = os.path.join(path, frame["file_path"] + extension)
 
