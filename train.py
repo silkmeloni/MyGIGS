@@ -31,6 +31,7 @@ from utils.loss_utils import l1_loss, ssim, get_img_grad_weight, bilateral_smoot
 from utils.graphics_utils import normal_from_depth_image
 
 from utils.warp_utils import warp_consistency_loss,material_consistency_loss
+from utils.runtime_profiler import RuntimeOverheadProfiler
 import random
 
 import torchvision
@@ -812,6 +813,7 @@ def training(
 
     normal_prop_debug_logger = NormalPropagationDebugLogger(args.model_path, args)
     consistency_debug_logger = MultiViewConsistencyDebugLogger(args.model_path, args)
+    overhead_profiler = RuntimeOverheadProfiler(args.model_path, args)
     if getattr(args, "use_normal_propagation", False):
         prop_start, prop_end = get_normal_propagation_bounds(args, pbr_iteration)
         print(
@@ -845,6 +847,7 @@ def training(
 
     for iteration in range(first_iter + 1, opt.iterations + 1):  # the real iteration (1 shift)
         iter_start.record()
+        overhead_iter_context = overhead_profiler.start_iteration(iteration)
         normal_prop_active = is_normal_propagation_active(args, iteration, pbr_iteration)
         if getattr(args, "use_normal_propagation", False):
             if normal_prop_active:
@@ -945,8 +948,14 @@ def training(
             "albedo_l1": 0.0,
             "skipped": 1.0,
         }
+        consistency_active = False
         consistency_tgt_uid = -1
         consistency_rank = -1
+        consistency_overhead_stats = {
+            "elapsed_ms": 0.0,
+            "peak_allocated_mb": 0.0,
+            "delta_allocated_mb": 0.0,
+        }
 
         aligned_mono_depth = None
         train_render_for_metrics = image
@@ -1528,6 +1537,7 @@ def training(
                 and (iteration % max(1, args.consistency_interval) == 0)
             )
             if consistency_active:
+                consistency_overhead_context = overhead_profiler.start_consistency(iteration)
                 render_pkg_src = rendering_result
                 viewpoint_src = viewpoint_cam
 
@@ -1603,6 +1613,10 @@ def training(
                     min_valid_ratio=args.consistency_min_valid_ratio,
                     max_valid_ratio=args.consistency_max_valid_ratio,
                 )
+                consistency_overhead_stats = overhead_profiler.end_consistency(
+                    consistency_overhead_context,
+                    consistency_stats,
+                )
 
             if iteration % 100 == 0:
                 save_pbr_debug_montage(
@@ -1669,6 +1683,12 @@ def training(
                 )
 
         iter_end.record()
+        overhead_profiler.record_iteration(
+            overhead_iter_context,
+            iter_start_event=iter_start,
+            iter_end_event=iter_end,
+            consistency_active=consistency_active,
+        )
 
         with torch.no_grad():
             # Progress bar
@@ -1743,6 +1763,9 @@ def training(
                         tb_writer.add_scalar('train_loss_patches/consist_rough_l1', consistency_stats["rough_l1"], iteration)
                         tb_writer.add_scalar('train_loss_patches/consist_metal_l1', consistency_stats["metal_l1"], iteration)
                         tb_writer.add_scalar('train_loss_patches/consist_skipped', consistency_stats["skipped"], iteration)
+                        tb_writer.add_scalar('runtime/consistency_elapsed_ms', consistency_overhead_stats["elapsed_ms"], iteration)
+                        tb_writer.add_scalar('runtime/consistency_peak_allocated_mb', consistency_overhead_stats["peak_allocated_mb"], iteration)
+                        tb_writer.add_scalar('runtime/consistency_delta_allocated_mb', consistency_overhead_stats["delta_allocated_mb"], iteration)
                     if getattr(args, "use_normal_propagation", False) and normal_prop_active:
                         tb_writer.add_scalar('train_loss_patches/normal_prop_valid_ratio', normal_prop_valid_ratio, iteration)
                         tb_writer.add_scalar('train_loss_patches/normal_prop_image_ratio', normal_prop_stats["image_ratio"], iteration)
@@ -1872,6 +1895,8 @@ def training(
 
         # time.sleep(0.15)
         torch.cuda.empty_cache()
+
+    overhead_profiler.finalize()
 
 
 def prepare_output_and_logger(args: GroupParams) -> Optional[SummaryWriter]:
@@ -2307,8 +2332,15 @@ if __name__ == "__main__":
                         help="Save multi-view consistency mask/error montages every N iterations; <=0 disables image dumps.")
     parser.add_argument("--consistency_log_interval", default=50, type=int,
                         help="Write CSV/JSON consistency diagnostics every N iterations; <=0 disables file logging.")
+    parser.add_argument("--disable_overhead_profile", action="store_true",
+                        help="Disable reviewer-facing runtime/memory overhead CSV, TXT, and PNG profiling outputs.")
+    parser.add_argument("--overhead_log_interval", default=50, type=int,
+                        help="Write overall runtime/memory overhead rows every N iterations; consistency rows are always logged when active.")
+    parser.add_argument("--overhead_plot_interval", default=500, type=int,
+                        help="Refresh runtime/memory overhead PNG plots every N iterations; <=0 only writes final plots.")
 
-    # 光照、颜色扰动和尺度正则。
+    # [新增] 开关中性光loss
+    # action='store_true' 表示：只要命令行里写了 --use_light，这个值就是 True，否则是 False
     parser.add_argument("--use_light", action='store_true', default=False,
                         help="Switch to enable light optimization/regularization module")
     parser.add_argument("--lambda_light", type=float, default=0.01, help="Weight for light regularization")
